@@ -11,7 +11,16 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import type {
   ChannelAgentBridge,
   ChannelConfig,
@@ -275,9 +284,22 @@ function makeBridge(): ChannelAgentBridge {
 
 class TestWeComChannel extends WeComChannel {
   readonly envelopes: Envelope[] = [];
+  readonly preflightedInbound = vi.fn();
+
+  protected override async processPreflightedInbound(
+    envelope: Envelope,
+    process: () => Promise<void> = () => this.processInbound(envelope),
+  ): Promise<void> {
+    this.preflightedInbound(envelope);
+    await super.processPreflightedInbound(envelope, process);
+  }
 
   protected override async processInbound(envelope: Envelope): Promise<void> {
     this.envelopes.push(envelope);
+  }
+
+  sendAttributed(chatId: string, text: string, sourceLabel: string) {
+    return this.sendThreadMessage(chatId, undefined, text, sourceLabel);
   }
 }
 
@@ -368,7 +390,22 @@ function channelFileDirs(): string[] {
   return readdirSync(parent).map((entry) => join(parent, entry));
 }
 
+// Capture before tests stub TMPDIR; one assertion checks the host temp root.
+const realTmpDir = tmpdir();
+const suiteTmpDir = mkdtempSync(join(realTmpDir, 'qwen-wecom-test-'));
+
 describe('WeComChannel', () => {
+  beforeAll(() => {
+    vi.stubEnv('TMPDIR', suiteTmpDir);
+    vi.stubEnv('TMP', suiteTmpDir);
+    vi.stubEnv('TEMP', suiteTmpDir);
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+    rmSync(suiteTmpDir, { recursive: true, force: true });
+  });
+
   beforeEach(() => {
     mocks.instances.length = 0;
     mocks.httpCalls.length = 0;
@@ -404,6 +441,30 @@ describe('WeComChannel', () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     rmSync(join(tmpdir(), 'channel-files'), { recursive: true, force: true });
+  });
+
+  it('shares attachment routing across senders in chat_thread scope', () => {
+    const channel = new WeComChannel(
+      'bot',
+      makeConfig({ sessionScope: 'chat_thread' }),
+      makeBridge(),
+    );
+    const routeKey = (
+      channel as unknown as {
+        attachmentRouteKey(
+          senderId: string,
+          chatId: string,
+          threadId?: string,
+        ): string;
+      }
+    ).attachmentRouteKey.bind(channel);
+
+    expect(routeKey('alice', 'chat-1', 'topic-1')).toBe(
+      routeKey('bob', 'chat-1', 'topic-1'),
+    );
+    expect(routeKey('alice', 'chat-1', 'topic-1')).not.toBe(
+      routeKey('alice', 'chat-2', 'topic-1'),
+    );
   });
 
   it('requires botId and secret', () => {
@@ -1460,7 +1521,7 @@ describe('WeComChannel', () => {
       'bot',
       makeConfig({
         groupPolicy: 'open',
-        groups: { '*': { requireMention: false } },
+        groups: { '*': {} },
       }),
       makeBridge(),
     );
@@ -1520,6 +1581,7 @@ describe('WeComChannel', () => {
     const mixed = channel.envelopes[0]!;
     expect(mixed.chatId).toBe('group-1');
     expect(mixed.isGroup).toBe(true);
+    expect(mixed.isMentioned).toBe(true);
     expect(mixed.text).toBe('@bot inspect this\nvoice transcript');
     expect(mixed.referencedText).toBe('previous voice text');
     expect(mixed.attachments?.[0]).toMatchObject({
@@ -1576,7 +1638,7 @@ describe('WeComChannel', () => {
     ).toBe(2);
   });
 
-  it('allows group replies to the bot without an explicit mention', async () => {
+  it('normalizes replies to the bot in group callbacks', async () => {
     const channel = new TestWeComChannel(
       'bot',
       makeConfig({
@@ -1593,7 +1655,6 @@ describe('WeComChannel', () => {
       chattype: 'group',
       chatid: 'group-1',
       from: { userid: 'alice' },
-      mentions: [],
       text: { content: 'follow up' },
       quote: {
         msgtype: 'text',
@@ -1605,7 +1666,7 @@ describe('WeComChannel', () => {
     await vi.waitFor(() => expect(channel.envelopes).toHaveLength(1));
     expect(channel.envelopes[0]).toMatchObject({
       isGroup: true,
-      isMentioned: false,
+      isMentioned: true,
       isReplyToBot: true,
       referencedText: 'bot response',
     });
@@ -1615,7 +1676,11 @@ describe('WeComChannel', () => {
     mocks.httpResponse.headers = {
       'content-disposition': 'attachment; filename="../secret.png"',
     };
-    const channel = new TestWeComChannel('bot', makeConfig(), makeBridge());
+    const channel = new TestWeComChannel(
+      'bot',
+      makeConfig({ messagePrefix: '/review' }),
+      makeBridge(),
+    );
     await channel.connect();
     const client = lastClient();
 
@@ -1629,79 +1694,93 @@ describe('WeComChannel', () => {
 
     await vi.waitFor(() => expect(channel.envelopes).toHaveLength(1));
     expect(channel.envelopes[0]?.attachments?.[0]?.fileName).toBe('secret.png');
+    expect(channel.envelopes[0]?.syntheticText).toBe(true);
   });
 
-  it('honors explicit group mention metadata when present', async () => {
-    const channel = new TestWeComChannel(
-      'bot',
-      makeConfig({
-        groupPolicy: 'open',
-        groups: { '*': { requireMention: false } },
-      }),
-      makeBridge(),
-    );
-    await channel.connect();
-    const client = lastClient();
+  it.each([
+    {
+      label: 'a transcribed voice message stays gated on the prefix',
+      event: 'message.voice',
+      payload: {
+        msgtype: 'voice',
+        voice: { content: 'please look at the build' },
+      },
+      dispatched: false,
+    },
+    {
+      label: 'a prefixed transcript is dispatched and stripped',
+      event: 'message.voice',
+      payload: {
+        msgtype: 'voice',
+        voice: { content: '/review please look at the build' },
+      },
+      dispatched: true,
+      text: 'please look at the build',
+      synthetic: undefined,
+    },
+    {
+      label: 'an untranscribed voice message runs as media',
+      event: 'message.voice',
+      payload: { msgtype: 'voice', voice: {} },
+      dispatched: true,
+      text: '(voice)',
+      synthetic: true,
+    },
+    {
+      label: 'a mixed message carrying text stays gated on the prefix',
+      event: 'message.mixed',
+      payload: {
+        msgtype: 'mixed',
+        mixed: {
+          msg_item: [
+            { msgtype: 'text', text: { content: 'inspect this' } },
+            { msgtype: 'image', image: {} },
+          ],
+        },
+      },
+      dispatched: false,
+    },
+    {
+      label: 'a mixed message with no text runs as media',
+      event: 'message.mixed',
+      payload: {
+        msgtype: 'mixed',
+        mixed: { msg_item: [{ msgtype: 'image', image: {} }] },
+      },
+      dispatched: true,
+      text: '',
+      synthetic: true,
+    },
+  ])(
+    'under a configured prefix, $label',
+    async ({ event, payload, dispatched, text, synthetic }) => {
+      // A transcript is the user's own words, so it carries the prefix like
+      // any other message; only the adapter's own placeholder is exempt.
+      vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const channel = new TestWeComChannel(
+        'bot',
+        makeConfig({ messagePrefix: '/review' }),
+        makeBridge(),
+      );
+      await channel.connect();
 
-    client.emit('message.text', {
-      msgid: 'msg-unmentioned',
-      msgtype: 'text',
-      chattype: 'group',
-      chatid: 'group-1',
-      from: { userid: 'bob' },
-      text: { content: 'background' },
-      mentions: [{ userid: 'other-bot' }],
-    });
-    client.emit('message.text', {
-      msgid: 'msg-mentioned',
-      msgtype: 'text',
-      chattype: 'group',
-      chatid: 'group-1',
-      from: { userid: 'bob' },
-      text: { content: '@bot inspect' },
-      mentions: [{ userid: 'bot-id' }],
-    });
-    client.emit('message.text', {
-      msgid: 'msg-other-mentioned',
-      msgtype: 'text',
-      chattype: 'group',
-      chatid: 'group-1',
-      from: { userid: 'bob' },
-      text: { content: '@someone else' },
-      isMentioned: true,
-      isInAtList: false,
-    });
+      lastClient().emit(event, {
+        msgid: `msg-${event}-${String(dispatched)}`,
+        chattype: 'single',
+        from: { userid: 'alice' },
+        ...payload,
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
 
-    await vi.waitFor(() => expect(channel.envelopes).toHaveLength(3));
-    expect(channel.envelopes.map((envelope) => envelope.isMentioned)).toEqual([
-      false,
-      true,
-      false,
-    ]);
-  });
-
-  it('treats empty mention metadata as explicitly unmentioned', async () => {
-    const channel = new TestWeComChannel(
-      'bot',
-      makeConfig({ groupPolicy: 'open', groups: { '*': {} } }),
-      makeBridge(),
-    );
-    await channel.connect();
-    const client = lastClient();
-
-    client.emit('message.text', {
-      msgid: 'msg-empty-mentions',
-      msgtype: 'text',
-      chattype: 'group',
-      chatid: 'group-1',
-      from: { userid: 'bob' },
-      text: { content: 'background' },
-      mentions: [],
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(channel.envelopes).toHaveLength(0);
-  });
+      if (!dispatched) {
+        expect(channel.envelopes).toHaveLength(0);
+        return;
+      }
+      await vi.waitFor(() => expect(channel.envelopes).toHaveLength(1));
+      expect(channel.envelopes[0]?.text).toBe(text);
+      expect(channel.envelopes[0]?.syntheticText).toBe(synthetic);
+    },
+  );
 
   it('logs sanitized payloads only when debug payload logging is enabled', async () => {
     const oldDebugPayload = process.env['QWEN_CHANNEL_DEBUG_PAYLOAD'];
@@ -1750,7 +1829,7 @@ describe('WeComChannel', () => {
     expect(logged).not.toContain('media-key');
   });
 
-  it('treats missing group mention metadata as unmentioned', async () => {
+  it('accepts delivered group messages without mention metadata', async () => {
     const channel = new TestWeComChannel(
       'bot',
       makeConfig({ groupPolicy: 'open', groups: { '*': {} } }),
@@ -1760,22 +1839,30 @@ describe('WeComChannel', () => {
     const client = lastClient();
 
     client.emit('message.text', {
-      msgid: 'msg-missing-mention-metadata',
-      msgtype: 'text',
-      chattype: 'group',
-      chatid: 'group-1',
-      from: { userid: 'bob' },
-      text: { content: 'background' },
+      cmd: 'aibot_msg_callback',
+      headers: { req_id: 'req-group-mention' },
+      body: {
+        msgid: 'msg-missing-mention-metadata',
+        aibotid: 'bot-id',
+        msgtype: 'text',
+        chattype: 'group',
+        chatid: 'group-1',
+        from: { userid: 'bob' },
+        text: { content: 'inspect this' },
+      },
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(channel.envelopes).toHaveLength(0);
+    await vi.waitFor(() => expect(channel.envelopes).toHaveLength(1));
+    expect(channel.envelopes[0]).toMatchObject({
+      isGroup: true,
+      isMentioned: true,
+    });
   });
 
-  it('does not download attachments for messages rejected by mention gate', async () => {
+  it('does not download attachments for messages rejected by group policy', async () => {
     const channel = new TestWeComChannel(
       'bot',
-      makeConfig({ groupPolicy: 'open', groups: { '*': {} } }),
+      makeConfig({ groupPolicy: 'disabled' }),
       makeBridge(),
     );
     await channel.connect();
@@ -1787,7 +1874,6 @@ describe('WeComChannel', () => {
       chattype: 'group',
       chatid: 'group-1',
       from: { userid: 'bob' },
-      mentions: [],
       image: { url: 'https://example.invalid/private-image', aeskey: 'k1' },
     });
 
@@ -1815,7 +1901,6 @@ describe('WeComChannel', () => {
       chattype: 'group',
       from: { userid: 'bob' },
       text: { content: '@bot inspect' },
-      mentions: [{ userid: 'bot-id' }],
     });
 
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1870,7 +1955,6 @@ describe('WeComChannel', () => {
       chatid: 'group-1',
       from: { userid: 'alice' },
       text: { content: '!pwd' },
-      mentions: [{ userid: 'bot-id' }],
     });
 
     await vi.waitFor(() => expect(client.sendMessage).toHaveBeenCalled());
@@ -1960,6 +2044,42 @@ describe('WeComChannel', () => {
     stderr.mockRestore();
   });
 
+  it('consumes prefix mismatches without repeatedly reconsidering them', async () => {
+    const stderr = vi
+      .spyOn(process.stderr, 'write')
+      .mockImplementation(() => true);
+    const bridge = makeBridge();
+    const channel = new WeComChannel(
+      'bot',
+      makeConfig({ messagePrefix: '/review' }),
+      bridge,
+    );
+    await channel.connect();
+    const client = lastClient();
+    const payload = {
+      msgid: 'msg-prefix-mismatch',
+      msgtype: 'text',
+      chattype: 'single',
+      from: { userid: 'alice' },
+      text: { content: 'hello' },
+    };
+
+    client.emit('message.text', payload);
+    await vi.waitFor(() =>
+      expect(stderr).toHaveBeenCalledWith(
+        '[Channel:bot] preflight rejected reason=message_prefix_mismatch\n',
+      ),
+    );
+    client.emit('message.text', payload);
+    await vi.waitFor(() =>
+      expect(stderr).toHaveBeenCalledWith(
+        '[WeCom:bot] dropping duplicate message msg-prefix-mismatch (already seen).\n',
+      ),
+    );
+    expect(bridge.prompt).not.toHaveBeenCalled();
+    stderr.mockRestore();
+  });
+
   it('allows messages interrupted during attachment download to be retried', async () => {
     const stderr = vi
       .spyOn(process.stderr, 'write')
@@ -1989,6 +2109,7 @@ describe('WeComChannel', () => {
 
     client.emit('message.image', payload);
     await vi.waitFor(() => expect(mocks.lookup).toHaveBeenCalledTimes(1));
+    expect(channel.preflightedInbound).toHaveBeenCalledTimes(1);
     inspectable.disconnectGeneration += 1;
     releaseLookup?.([{ address: '93.184.216.34', family: 4 }]);
     await vi.waitFor(() =>
@@ -2734,7 +2855,11 @@ describe('WeComChannel', () => {
       .spyOn(process.stderr, 'write')
       .mockImplementation(() => true);
     mocks.httpResponse.statusCode = 500;
-    const channel = new TestWeComChannel('bot', makeConfig(), makeBridge());
+    const channel = new TestWeComChannel(
+      'bot',
+      makeConfig({ messagePrefix: '/review' }),
+      makeBridge(),
+    );
     await channel.connect();
     const client = lastClient();
 
@@ -2748,6 +2873,9 @@ describe('WeComChannel', () => {
 
     await vi.waitFor(() => expect(channel.envelopes).toHaveLength(1));
     expect(channel.envelopes[0]?.attachments).toBeUndefined();
+    expect(channel.envelopes[0]?.text).toBe(
+      '(User sent media but download failed)',
+    );
     expect(mocks.httpCalls[0]?.request.destroy).toHaveBeenCalled();
     expect(stderr).toHaveBeenCalledWith(
       expect.stringContaining('media download failed: HTTP 500'),
@@ -3362,44 +3490,47 @@ describe('WeComChannel', () => {
     await vi.waitFor(() => expect(existsSync(dirname(filePath!))).toBe(false));
   });
 
-  it('continues attachment cleanup when one dir removal fails', async () => {
-    const parent = join(tmpdir(), 'channel-files');
-    mkdirSync(parent, { recursive: true });
-    const blockedParent = mkdtempSync(join(parent, 'wecom-blocked-'));
-    const firstDir = join(blockedParent, 'first');
-    mkdirSync(firstDir);
-    chmodSync(blockedParent, 0o500);
-    const secondDir = mkdtempSync(join(parent, 'wecom-test-'));
-    const channel = new WeComChannel('bot', makeConfig(), makeBridge());
-    const harness = channel as unknown as {
-      rememberAttachmentDir(
-        dir: string,
-        messageId?: string,
-        routeKey?: string,
-      ): void;
-      cleanupAllAttachmentDirs(): void;
-    };
-    harness.rememberAttachmentDir(firstDir, 'msg-first');
-    harness.rememberAttachmentDir(secondDir, 'msg-second');
-    const stderr = vi
-      .spyOn(process.stderr, 'write')
-      .mockImplementation(() => true);
+  it.skipIf(process.platform === 'win32')(
+    'continues attachment cleanup when one dir removal fails',
+    async () => {
+      const parent = join(tmpdir(), 'channel-files');
+      mkdirSync(parent, { recursive: true });
+      const blockedParent = mkdtempSync(join(parent, 'wecom-blocked-'));
+      const firstDir = join(blockedParent, 'first');
+      mkdirSync(firstDir);
+      chmodSync(blockedParent, 0o500);
+      const secondDir = mkdtempSync(join(parent, 'wecom-test-'));
+      const channel = new WeComChannel('bot', makeConfig(), makeBridge());
+      const harness = channel as unknown as {
+        rememberAttachmentDir(
+          dir: string,
+          messageId?: string,
+          routeKey?: string,
+        ): void;
+        cleanupAllAttachmentDirs(): void;
+      };
+      harness.rememberAttachmentDir(firstDir, 'msg-first');
+      harness.rememberAttachmentDir(secondDir, 'msg-second');
+      const stderr = vi
+        .spyOn(process.stderr, 'write')
+        .mockImplementation(() => true);
 
-    try {
-      harness.cleanupAllAttachmentDirs();
+      try {
+        harness.cleanupAllAttachmentDirs();
 
-      expect(existsSync(firstDir)).toBe(true);
-      expect(existsSync(secondDir)).toBe(false);
-      expect(stderr).toHaveBeenCalledWith(
-        expect.stringContaining('failed to remove attachment dir'),
-      );
-    } finally {
-      stderr.mockRestore();
-      chmodSync(blockedParent, 0o700);
-      rmSync(blockedParent, { recursive: true, force: true });
-      rmSync(secondDir, { recursive: true, force: true });
-    }
-  });
+        expect(existsSync(firstDir)).toBe(true);
+        expect(existsSync(secondDir)).toBe(false);
+        expect(stderr).toHaveBeenCalledWith(
+          expect.stringContaining('failed to remove attachment dir'),
+        );
+      } finally {
+        stderr.mockRestore();
+        chmodSync(blockedParent, 0o700);
+        rmSync(blockedParent, { recursive: true, force: true });
+        rmSync(secondDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('removes session attachment dirs when prompt end has no message id', async () => {
     const bridge = makeBridge();
@@ -4083,6 +4214,53 @@ describe('WeComChannel', () => {
     );
   });
 
+  it('extracts media first and repeats an escaped label within every byte-limited chunk', async () => {
+    const channel = new TestWeComChannel('bot', makeConfig(), makeBridge());
+    await channel.connect();
+    const client = lastClient();
+    const sourceLabel = '[review_*]';
+
+    await channel.sendAttributed(
+      'chat-1',
+      Array.from(
+        { length: 80 },
+        (_, index) => `paragraph ${index}: ${'x'.repeat(80)}`,
+      ).join('\n'),
+      sourceLabel,
+    );
+
+    const chunks = client.sendMessage.mock.calls.map((call) => {
+      const message = call[1] as { markdown: { content: string } };
+      return message.markdown.content;
+    });
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.startsWith('\\[review\\_\\*\\]\n')).toBe(true);
+      expect(Buffer.byteLength(chunk, 'utf8')).toBeLessThanOrEqual(3800);
+    }
+  });
+
+  it('keeps attributed fenced-code openings line-leading in every chunk', async () => {
+    const channel = new TestWeComChannel('bot', makeConfig(), makeBridge());
+    await channel.connect();
+    const client = lastClient();
+
+    await channel.sendAttributed(
+      'chat-1',
+      `\`\`\`text\n${'x'.repeat(3900)}\n\`\`\``,
+      '[review]',
+    );
+
+    const chunks = client.sendMessage.mock.calls.map((call) => {
+      const message = call[1] as { markdown: { content: string } };
+      return message.markdown.content;
+    });
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk).toMatch(/^\\\[review\\\]\n(?:```|~~~)/u);
+    }
+  });
+
   it('splits long markdown responses without array-copying the remaining line', async () => {
     const arrayFrom = vi.spyOn(Array, 'from');
     const channel = new WeComChannel('bot', makeConfig(), makeBridge());
@@ -4389,7 +4567,7 @@ describe('WeComChannel', () => {
   });
 
   it('does not allow a hardcoded /tmp channel-files fallback', async () => {
-    if (tmpdir() === '/tmp') return;
+    if (realTmpDir === '/tmp') return;
 
     const stderr = vi
       .spyOn(process.stderr, 'write')

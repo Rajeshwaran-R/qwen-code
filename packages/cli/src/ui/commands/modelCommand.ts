@@ -19,6 +19,7 @@ import {
   type AvailableModel,
   type Config,
   isImageCapable,
+  isImageGenerationCapable,
   parseVisionModelSetting,
   resolveModelId,
 } from '@qwen-code/qwen-code-core';
@@ -27,6 +28,7 @@ import {
   isInlineModelOverrideAllowed,
   parseAcpModelOption,
 } from '../../utils/acpModelUtils.js';
+import { recordDaemonSessionModelFromConfig } from '../../acp-integration/session-model-persistence.js';
 import {
   formatUnsupportedVoiceModelMessage,
   isSelectableVoiceModel,
@@ -38,11 +40,32 @@ const MAIN_MODEL_CONFIGURATION_HINT =
 const FAST_MODEL_CONFIGURATION_HINT =
   'Configure models in settings.modelProviders and ensure the required environment variables are set. In interactive mode, run /auth to configure or switch providers, or run /model --fast without a model to choose from configured models.';
 
+const VISION_MODEL_CONFIGURATION_HINT =
+  'Configure an image-capable model in settings.modelProviders and ensure the required environment variables are set. Run /model --vision <model-id> to set it, or leave it unset to auto-pick a same-provider vision model.';
+
 const COMPACTION_MODEL_CONFIGURATION_HINT =
   'Configure models in settings.modelProviders and ensure the required environment variables are set. In interactive mode, run /auth to configure or switch providers, or run /model --compaction without a model to choose from configured models.';
 
-const VISION_MODEL_CONFIGURATION_HINT =
-  'Configure an image-capable model in settings.modelProviders and ensure the required environment variables are set. Run /model --vision <model-id> to set it, or leave it unset to auto-pick a same-provider vision model.';
+const IMAGE_MODEL_CONFIGURATION_HINT =
+  'Configure a model with supportsImageGeneration: true (or legacy imageOnly: true), baseUrl, and envKey in settings.modelProviders. Run /model --image <model-id> to select it.';
+
+const MODEL_PICKER_FLAGS = [
+  'fast',
+  'voice',
+  'vision',
+  'compaction',
+  'image',
+  'project',
+  'global',
+] as const;
+const MODEL_PICKER_FLAG_PATTERN = `(?:${MODEL_PICKER_FLAGS.join('|')})`;
+const MODEL_PICKER_ONLY_PATTERN = new RegExp(
+  `^(?:\\s*--${MODEL_PICKER_FLAG_PATTERN})*\\s*$`,
+);
+
+export function isPickerOnlyModelInvocation(args: string): boolean {
+  return MODEL_PICKER_ONLY_PATTERN.test(args);
+}
 
 /**
  * Parse --project / --global scope flags from the argument string.
@@ -111,6 +134,7 @@ async function switchMainModel(
   currentAuthType: AuthType,
   modelArg: string,
   scopeOverride?: SettingScope,
+  persistSelection = true,
 ): Promise<string> {
   const parsed = parseAcpModelOption(modelArg);
 
@@ -123,30 +147,39 @@ async function switchMainModel(
         ? { requireCachedCredentials: true }
         : undefined,
     );
-    persistSetting(
-      settings,
-      'security.auth.selectedType',
-      parsed.authType,
-      scopeOverride,
-    );
-    persistSetting(settings, 'model.name', parsed.modelId, scopeOverride);
-    // `/model <id>` selects by id only, so clear any baseUrl disambiguator left
-    // by a previous model-picker selection — otherwise next launch would
-    // resolve to a different provider than this switch just chose. Use an
-    // empty-string tombstone so the clear overrides a lower-scope value (an
-    // undefined write is dropped from JSON and would not override on merge).
-    persistSetting(settings, 'model.baseUrl', '', scopeOverride);
+    if (persistSelection) {
+      persistSetting(
+        settings,
+        'security.auth.selectedType',
+        parsed.authType,
+        scopeOverride,
+      );
+      persistSetting(settings, 'model.name', parsed.modelId, scopeOverride);
+      // `/model <id>` selects by id only, so clear any baseUrl disambiguator left
+      // by a previous model-picker selection — otherwise next launch would
+      // resolve to a different provider than this switch just chose. Use an
+      // empty-string tombstone so the clear overrides a lower-scope value (an
+      // undefined write is dropped from JSON and would not override on merge).
+      persistSetting(settings, 'model.baseUrl', '', scopeOverride);
+    }
     return parsed.modelId;
   }
 
   await config.switchModel(currentAuthType, modelArg, undefined);
-  persistSetting(settings, 'model.name', modelArg, scopeOverride);
-  persistSetting(settings, 'model.baseUrl', '', scopeOverride);
+  if (persistSelection) {
+    persistSetting(settings, 'model.name', modelArg, scopeOverride);
+    persistSetting(settings, 'model.baseUrl', '', scopeOverride);
+  }
   return modelArg;
 }
 
 function formatUnavailableModelMessage(
-  kind: 'Model' | 'Fast model' | 'Vision model' | 'Compaction model',
+  kind:
+    | 'Model'
+    | 'Fast model'
+    | 'Vision model'
+    | 'Compaction model'
+    | 'Image model',
   modelName: string,
   authType: AuthType,
   availableModels: AvailableModel[],
@@ -166,7 +199,9 @@ function formatUnavailableModelMessage(
         ? VISION_MODEL_CONFIGURATION_HINT
         : kind === 'Compaction model'
           ? COMPACTION_MODEL_CONFIGURATION_HINT
-          : MAIN_MODEL_CONFIGURATION_HINT;
+          : kind === 'Image model'
+            ? IMAGE_MODEL_CONFIGURATION_HINT
+            : MAIN_MODEL_CONFIGURATION_HINT;
 
   return (
     `${kind} '${modelName}' is not available for auth type '${authType}'.\n` +
@@ -175,10 +210,10 @@ function formatUnavailableModelMessage(
   );
 }
 
-// Fast, vision, and compaction share the same "not configured for any auth type" message
-// shape, differing only in the label and the configuration hint.
+// Auxiliary model selectors share the same "not configured for any auth type"
+// message shape, differing only in the label and configuration hint.
 function formatUnavailableAuxModelMessage(
-  label: 'Fast model' | 'Vision model' | 'Compaction model',
+  label: 'Fast model' | 'Vision model' | 'Compaction model' | 'Image model',
   modelName: string,
   availableModels: AvailableModel[],
   hint: string,
@@ -231,6 +266,18 @@ function formatUnavailableCompactionModelMessage(
     modelName,
     availableModels,
     COMPACTION_MODEL_CONFIGURATION_HINT,
+  );
+}
+
+function formatUnavailableImageModelMessage(
+  modelName: string,
+  availableModels: AvailableModel[],
+): string {
+  return formatUnavailableAuxModelMessage(
+    'Image model',
+    modelName,
+    availableModels,
+    IMAGE_MODEL_CONFIGURATION_HINT,
   );
 }
 
@@ -311,18 +358,25 @@ function formatUnavailableVoiceModelMessage(
 // Get an array of the available model IDs as strings, filtered by mode
 function getAvailableModelIds(
   context: CommandContext,
-  mode: 'main' | 'fast' | 'voice' | 'vision' | 'compaction' = 'main',
+  mode: 'main' | 'fast' | 'voice' | 'vision' | 'compaction' | 'image' = 'main',
 ) {
   const { services } = context;
   const { config } = services;
   if (!config) {
     return [];
   }
-  const availableModels = config.getAvailableModels().filter((m) => {
-    if (mode === 'fast' || mode === 'compaction') return !m.voiceOnly;
-    if (mode === 'voice') return !m.fastOnly;
-    // 'vision' and 'main' both exclude fast/voice-only models.
-    return !m.fastOnly && !m.voiceOnly;
+  const models =
+    mode === 'image'
+      ? config.getAllConfiguredModels()
+      : config.getAvailableModels();
+  const availableModels = models.filter((m) => {
+    if (mode === 'image')
+      return isImageGenerationCapable(m) && !m.fastOnly && !m.voiceOnly;
+    if (mode === 'vision') return !m.fastOnly && !m.voiceOnly && !m.imageOnly;
+    if (mode === 'fast') return !m.voiceOnly && !m.imageOnly && !m.visionOnly;
+    if (mode === 'voice') return !m.fastOnly && !m.imageOnly && !m.visionOnly;
+    // 'main' and 'compaction' exclude all selector-only models.
+    return !m.fastOnly && !m.voiceOnly && !m.imageOnly && !m.visionOnly;
   });
   return availableModels.map((model) => model.id);
 }
@@ -332,11 +386,11 @@ export const modelCommand: SlashCommand = {
   completionPriority: 100,
   get description() {
     return t(
-      'Switch the model for this session (--fast for suggestion model, --voice for voice transcription model, --vision for the vision bridge model, --compaction for chat compression model, --project to persist to project settings, --global to persist to user settings, [model-id] to switch immediately, or [model-id] [prompt] to run a one-off prompt on another model; the inline prompt is sent verbatim without @file expansion).',
+      'Switch the model for this session (--fast for suggestion model, --voice for voice transcription model, --vision for the vision bridge model, --compaction for chat compression model, --image for the image generation model, --project to persist to project settings, --global to persist to user settings, [model-id] to switch immediately, or [model-id] [prompt] to run a one-off prompt on another model; the inline prompt is sent verbatim without @file expansion).',
     );
   },
   argumentHint:
-    '[--fast|--voice|--vision|--compaction] [--project|--global] [<model-id>] | <model-id> <prompt>',
+    '[--fast|--voice|--vision|--compaction|--image] [--project|--global] [<model-id>] | <model-id> <prompt>',
   kind: CommandKind.BUILT_IN,
   supportedModes: ['interactive', 'non_interactive', 'acp'] as const,
   completion: async (context, partialArg) => {
@@ -365,6 +419,10 @@ export const modelCommand: SlashCommand = {
           ),
         },
         {
+          value: '--image',
+          description: t('Set the model used to generate images'),
+        },
+        {
           value: '--project',
           description: t(
             'Persist the model selection to the project settings (workspace scope)',
@@ -382,20 +440,29 @@ export const modelCommand: SlashCommand = {
       }
       const trimmed = partialArg.trim();
       if (trimmed) {
-        let mode: 'main' | 'fast' | 'voice' | 'vision' | 'compaction' = 'main';
+        let mode:
+          | 'main'
+          | 'fast'
+          | 'voice'
+          | 'vision'
+          | 'compaction'
+          | 'image' = 'main';
         // Strip all known flags to isolate the model prefix for completion
         const modelPrefix = trimmed
           .replace(/(?:^|\s)--fast(?:\s|$)/, ' ')
           .replace(/(?:^|\s)--voice(?:\s|$)/, ' ')
           .replace(/(?:^|\s)--vision(?:\s|$)/, ' ')
           .replace(/(?:^|\s)--compaction(?:\s|$)/, ' ')
+          .replace(/(?:^|\s)--image(?:\s|$)/, ' ')
           .replace(/(?:^|\s)--project(?:\s|$)/, ' ')
           .replace(/(?:^|\s)--global(?:\s|$)/, ' ')
           .trim();
         if (/(?:^|\s)--fast(?:\s|$)/.test(trimmed)) mode = 'fast';
         else if (/(?:^|\s)--voice(?:\s|$)/.test(trimmed)) mode = 'voice';
         else if (/(?:^|\s)--vision(?:\s|$)/.test(trimmed)) mode = 'vision';
-        else if (/(?:^|\s)--compaction(?:\s|$)/.test(trimmed)) mode = 'compaction';
+        else if (/(?:^|\s)--compaction(?:\s|$)/.test(trimmed))
+          mode = 'compaction';
+        else if (/(?:^|\s)--image(?:\s|$)/.test(trimmed)) mode = 'image';
         return getAvailableModelIds(context, mode).filter((id) =>
           id.startsWith(modelPrefix),
         );
@@ -438,6 +505,20 @@ export const modelCommand: SlashCommand = {
         content: t(
           'Cannot use both --project and --global. Choose one scope flag.',
         ),
+      };
+    }
+    const auxiliarySelection =
+      /(?:^|\s)--(?:fast|voice|vision|compaction|image)(?:\s|$)/.test(rawArgs);
+    if (
+      (hasProject &&
+        context.executionPolicy?.allowWorkspaceSettingsWrite === false) ||
+      (context.executionPolicy?.persistModelSelection === false &&
+        (hasProject || hasGlobal || auxiliarySelection))
+    ) {
+      return {
+        type: 'message',
+        messageType: 'error',
+        content: t('This model selection is not available in this session.'),
       };
     }
     // Reject --project when workspace is untrusted — workspace settings are
@@ -494,7 +575,7 @@ export const modelCommand: SlashCommand = {
 
       const availableModels = config
         .getAllConfiguredModels()
-        .filter((m) => !m.fastOnly);
+        .filter((m) => !m.fastOnly && !m.imageOnly && !m.visionOnly);
       const matches = availableModels.filter((model) => model.id === modelName);
       if (matches.length === 0) {
         return {
@@ -590,7 +671,7 @@ export const modelCommand: SlashCommand = {
         selector.authType
           ? config.getAvailableModelsForAuthType(selector.authType)
           : config.getAllConfiguredModels()
-      ).filter((m) => !m.voiceOnly);
+      ).filter((m) => !m.voiceOnly && !m.imageOnly && !m.visionOnly);
       if (!availableModels.some((model) => model.id === selector.modelId)) {
         return {
           type: 'message',
@@ -673,7 +754,7 @@ export const modelCommand: SlashCommand = {
         selector.authType
           ? config.getAvailableModelsForAuthType(selector.authType)
           : config.getAllConfiguredModels()
-      ).filter((m) => !m.fastOnly && !m.voiceOnly);
+      ).filter((m) => !m.fastOnly && !m.voiceOnly && !m.imageOnly);
       const matchingModels = availableModels.filter(
         (model) => model.id === selector.modelId,
       );
@@ -740,16 +821,32 @@ export const modelCommand: SlashCommand = {
       args === '--compaction' || args.startsWith('--compaction ');
     if (isCompactionModelCommand) {
       const modelName = args.replace('--compaction', '').trim();
-      if (!modelName) {
+      if (!modelName || modelName === 'clear') {
+        if (modelName === 'clear') {
+          if (!settings) {
+            return {
+              type: 'message',
+              messageType: 'error',
+              content: t('Settings service not available.'),
+            };
+          }
+          persistSetting(settings, 'compactionModel', undefined, scopeOverride);
+          config.setCompactionModel(undefined);
+          return {
+            type: 'message',
+            messageType: 'info',
+            content: t('Compaction model override cleared') + scopeSuffix,
+          };
+        }
         if (context.executionMode !== 'interactive') {
           const compactionModel =
             context.services.settings?.merged?.compactionModel?.trim() ||
-            t('not set (falls back to fast model, then main model)');
+            t('not set (falls back to the main model)');
           return {
             type: 'message',
             messageType: 'info',
             content: t(
-              'Current compaction model: {{compactionModel}}\nUse "/model --compaction <model-id>" to set compaction model, or "/model --compaction " to clear the override.',
+              'Current compaction model: {{compactionModel}}\nUse "/model --compaction <model-id>" to set compaction model, or "/model --compaction clear" to clear the override.',
               { compactionModel },
             ),
           };
@@ -757,6 +854,7 @@ export const modelCommand: SlashCommand = {
         return {
           type: 'dialog',
           dialog: 'compaction-model',
+          ...persistScopeSpread(scopeOverride),
         };
       }
       if (!settings) {
@@ -786,7 +884,9 @@ export const modelCommand: SlashCommand = {
         selector.authType
           ? config.getAvailableModelsForAuthType(selector.authType)
           : config.getAllConfiguredModels()
-      ).filter((m) => !m.voiceOnly);
+      ).filter(
+        (m) => !m.fastOnly && !m.voiceOnly && !m.imageOnly && !m.visionOnly,
+      );
       if (!availableModels.some((model) => model.id === selector.modelId)) {
         return {
           type: 'message',
@@ -805,13 +905,128 @@ export const modelCommand: SlashCommand = {
         };
       }
 
-      persistSetting(settings, 'compactionModel', modelName);
+      persistSetting(settings, 'compactionModel', modelName, scopeOverride);
       // Sync runtime Config so the compression service picks it up immediately.
       config.setCompactionModel(modelName);
       return {
         type: 'message',
         messageType: 'info',
-        content: t('Compaction Model') + ': ' + modelName,
+        content: t('Compaction Model') + ': ' + modelName + scopeSuffix,
+      };
+    }
+
+    const isImageModelCommand =
+      args === '--image' || args.startsWith('--image ');
+    if (isImageModelCommand) {
+      const modelName = args.replace('--image', '').trim();
+      if (!modelName) {
+        if (context.executionMode !== 'interactive') {
+          const imageModel =
+            context.services.settings?.merged?.imageModel?.trim();
+          return {
+            type: 'message',
+            messageType: 'info',
+            content: t(
+              'Current image model: {{imageModel}}\nUse "/model --image <model-id>" to set the image generation model.',
+              {
+                imageModel: imageModel
+                  ? formatVisionModelSettingForDisplay(imageModel)
+                  : t('not set'),
+              },
+            ),
+          };
+        }
+        return {
+          type: 'dialog',
+          dialog: 'image-model',
+          ...persistScopeSpread(scopeOverride),
+        };
+      }
+      if (!settings) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: t('Settings service not available.'),
+        };
+      }
+
+      const selector = (() => {
+        try {
+          return resolveModelId(modelName);
+        } catch {
+          return undefined;
+        }
+      })();
+      if (!selector) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: formatUnavailableImageModelMessage(modelName, []),
+        };
+      }
+
+      const availableModels = (
+        selector.authType
+          ? config.getAvailableModelsForAuthType(selector.authType)
+          : config.getAllConfiguredModels()
+      ).filter(
+        (model) =>
+          isImageGenerationCapable(model) &&
+          !model.fastOnly &&
+          !model.voiceOnly,
+      );
+      const matchingModels = availableModels.filter(
+        (model) => model.id === selector.modelId,
+      );
+      if (matchingModels.length > 1) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: t(
+            "Image model '{{modelName}}' matches multiple configured endpoints. Run /model --image without an argument and choose the exact endpoint.",
+            { modelName },
+          ),
+        };
+      }
+      const matched = matchingModels[0];
+      if (!matched) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: selector.authType
+            ? formatUnavailableModelMessage(
+                'Image model',
+                selector.modelId,
+                selector.authType,
+                availableModels,
+              )
+            : formatUnavailableImageModelMessage(modelName, availableModels),
+        };
+      }
+
+      const qualifiedModelName = `${
+        selector.authType ?? matched.authType
+      }:${selector.modelId}`;
+      const imageModel = matched.baseUrl
+        ? `${qualifiedModelName}\0${matched.baseUrl}`
+        : qualifiedModelName;
+      if (!config.resolveImageGenerationModel(imageModel)) {
+        return {
+          type: 'message',
+          messageType: 'error',
+          content: t(
+            "Image model '{{modelName}}' must declare a valid HTTPS baseUrl and credential environment variable.",
+            { modelName },
+          ),
+        };
+      }
+
+      persistSetting(settings, 'imageModel', imageModel, scopeOverride);
+      await config.setImageModel(imageModel);
+      return {
+        type: 'message',
+        messageType: 'info',
+        content: t('Image Model') + ': ' + modelName + scopeSuffix,
       };
     }
 
@@ -847,7 +1062,7 @@ export const modelCommand: SlashCommand = {
       const targetAuthType = parsed.authType ?? authType;
       const availableModels = config
         .getAvailableModelsForAuthType(targetAuthType)
-        .filter((m) => !m.fastOnly && !m.voiceOnly);
+        .filter((m) => !m.fastOnly && !m.voiceOnly && !m.imageOnly);
       if (!availableModels.some((model) => model.id === parsed.modelId)) {
         return {
           type: 'message',
@@ -940,7 +1155,11 @@ export const modelCommand: SlashCommand = {
         authType,
         modelName,
         scopeOverride,
+        context.executionPolicy?.persistModelSelection !== false,
       );
+      if (context.executionMode === 'acp') {
+        await recordDaemonSessionModelFromConfig(config);
+      }
       return {
         type: 'message',
         messageType: 'info',

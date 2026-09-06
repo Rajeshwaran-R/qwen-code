@@ -30,6 +30,8 @@ from .transport import ProcessTransport
 from .types import (
     CanUseToolContext,
     Effort,
+    EffortOverride,
+    EffortStatus,
     PermissionDenyResult,
     QueryOptions,
     QueryOptionsDict,
@@ -37,6 +39,19 @@ from .types import (
 from .validation import validate_query_options
 
 _DONE = object()
+
+
+def _parse_effort_status(value: Any) -> EffortStatus | None:
+    if not isinstance(value, dict) or not isinstance(value.get("applied"), bool):
+        return None
+    status: EffortStatus = {
+        "applied": value["applied"],
+        "override": cast(EffortOverride | None, value.get("override")),
+    }
+    reason = value.get("reason")
+    if isinstance(reason, str):
+        status["reason"] = reason
+    return status
 
 
 @dataclass
@@ -65,7 +80,9 @@ class Query:
         self._prompt = prompt
         self._single_turn = isinstance(prompt, str)
         self._session_id = session_id
-        self._session_id_locked = bool(options.resume or options.session_id)
+        self._session_id_locked = bool(
+            (options.resume or options.session_id) and not options.fork_session
+        )
 
         self._message_queue: asyncio.Queue[SDKMessage | Exception | object] = (
             asyncio.Queue()
@@ -84,6 +101,7 @@ class Query:
 
         self._pending_control_requests: dict[str, _PendingControlRequest] = {}
         self._incoming_control_requests: dict[str, _IncomingControlRequest] = {}
+        self._initial_effort_status: EffortStatus | None = None
 
     async def _ensure_started(self) -> None:
         if self._closed:
@@ -111,9 +129,16 @@ class Query:
     async def _initialize(self) -> None:
         try:
             payload: dict[str, Any] = {"hooks": None}
+            if self._options.mcp_servers:
+                payload["mcpServers"] = self._options.mcp_servers
+            if self._options.agents:
+                payload["agents"] = self._options.agents
             if self._options.effort:
                 payload["effort"] = self._options.effort
-            await self._send_control_request("initialize", payload)
+            response = await self._send_control_request("initialize", payload)
+            self._initial_effort_status = _parse_effort_status(
+                response.get("effort_status") if response else None
+            )
         except Exception as exc:
             await self._finish_with_error(exc)
 
@@ -486,11 +511,19 @@ class Query:
         return await self._send_control_request("mcp_server_status")
 
     async def set_effort(self, effort: Effort) -> bool:
+        return (await self.set_effort_status(effort))["applied"]
+
+    async def set_effort_status(self, effort: Effort) -> EffortStatus:
         await self._ensure_started()
         response = await self._send_control_request("set_effort", {"effort": effort})
-        if response is None:
-            return False
-        return bool(response.get("applied", False))
+        return _parse_effort_status(response) or {
+            "applied": False,
+            "override": None,
+        }
+
+    @property
+    def initial_effort_status(self) -> EffortStatus | None:
+        return self._initial_effort_status
 
     async def get_available_models(self) -> dict[str, Any] | None:
         await self._ensure_started()
@@ -629,11 +662,15 @@ def query(
 
     validate_query_options(parsed_options)
 
-    session_id = parsed_options.resume or parsed_options.session_id
-    if session_id is None and not parsed_options.continue_session:
-        session_id = str(uuid4())
-    if parsed_options.resume is None and not parsed_options.continue_session:
-        parsed_options = replace(parsed_options, session_id=session_id)
+    session_id: str | None
+    if parsed_options.fork_session:
+        session_id = parsed_options.session_id or str(uuid4())
+    else:
+        session_id = parsed_options.resume or parsed_options.session_id
+        if session_id is None and not parsed_options.continue_session:
+            session_id = str(uuid4())
+        if parsed_options.resume is None and not parsed_options.continue_session:
+            parsed_options = replace(parsed_options, session_id=session_id)
 
     transport = ProcessTransport(parsed_options)
     return Query(transport, parsed_options, prompt, session_id or "")

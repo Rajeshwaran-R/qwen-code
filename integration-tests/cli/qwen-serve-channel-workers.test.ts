@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -27,6 +28,10 @@ const REPO_ROOT = path.resolve(__dirname, '../..');
 const CLI_BIN =
   process.env['TEST_CLI_PATH'] ?? path.join(REPO_ROOT, 'dist', 'cli.js');
 const TOKEN = 'multi-workspace-channel-test-token';
+// The 10s production handshake budget is a desktop budget, not a shared-runner
+// one: macOS E2E shards died on it in #11030 and reddened again in #11034.
+// Match qwen-serve-routes.test.ts.
+const ACP_INITIALIZE_TIMEOUT_MS = 60_000;
 
 let daemon: ChildProcess | undefined;
 let primaryServer: MockServerHandle | undefined;
@@ -35,12 +40,57 @@ let testRoot: string | undefined;
 
 interface ChannelWorkersStatus {
   runtime?: {
+    channelWorker?: {
+      workspaceCwd?: string;
+      state: string;
+      channels: string[];
+      startupFailures?: ChannelStartupFailure[];
+    };
     channelWorkers?: Array<{
       workspaceCwd: string;
       state: string;
       channels: string[];
     }>;
   };
+}
+
+interface ChannelStartupFailure {
+  workspaceCwd?: string;
+  channel: string;
+  phase: string;
+  code?: string;
+  message: string;
+}
+
+interface ChannelControlState {
+  enabled: boolean;
+  selection: { mode: 'all' } | { mode: 'names'; names: string[] } | null;
+  transition: string;
+  workers: Array<{
+    workspaceCwd: string;
+    state: string;
+    channels: string[];
+    pid?: number;
+    startupFailures?: ChannelStartupFailure[];
+    startupFailuresTruncated?: boolean;
+  }>;
+}
+
+async function createClosedWebSocketUrl(): Promise<string> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    server.close();
+    throw new Error('failed to allocate a closed test port');
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return `ws://127.0.0.1:${address.port}`;
 }
 
 function writeJson(file: string, value: unknown): void {
@@ -145,6 +195,32 @@ async function waitForRunningWorkers(
   );
 }
 
+async function waitForRunningControl(
+  baseUrl: string,
+): Promise<ChannelControlState> {
+  const deadline = Date.now() + 15_000;
+  let lastState: ChannelControlState | undefined;
+  while (Date.now() < deadline) {
+    const response = await fetch(`${baseUrl}/workspace/channel`, {
+      headers: { Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(response.status).toBe(200);
+    lastState = (await response.json()) as ChannelControlState;
+    if (
+      lastState.enabled &&
+      lastState.transition === 'idle' &&
+      lastState.workers.length === 1 &&
+      lastState.workers[0]?.state === 'running'
+    ) {
+      return lastState;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `runtime channel did not reach running state: ${JSON.stringify(lastState)}`,
+  );
+}
+
 afterEach(async () => {
   await stopDaemon(daemon);
   await Promise.allSettled([
@@ -159,6 +235,443 @@ afterEach(async () => {
 });
 
 describe('qwen serve multi-workspace channel workers', () => {
+  it('controls a real mock-plugin worker after a channel-less boot', async () => {
+    testRoot = realpathSync(
+      mkdtempSync(path.join(tmpdir(), 'qwen-serve-channel-runtime-')),
+    );
+    const qwenHome = path.join(testRoot, 'qwen-home');
+    const runtimeDir = path.join(testRoot, 'runtime');
+    const workspace = path.join(testRoot, 'workspace');
+    mkdirSync(workspace);
+    mkdirSync(runtimeDir);
+    primaryServer = await createMockServer({ httpPort: 0, wsPort: 0 });
+
+    const extensionDir = path.join(qwenHome, 'extensions');
+    mkdirSync(extensionDir, { recursive: true });
+    symlinkSync(
+      path.join(REPO_ROOT, 'packages', 'channels', 'plugin-example'),
+      path.join(extensionDir, 'qwen-channel-plugin-example'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    writeJson(path.join(qwenHome, 'settings.json'), {
+      security: { folderTrust: { enabled: true } },
+    });
+    const trustedFoldersPath = path.join(qwenHome, 'trustedFolders.json');
+    writeJson(trustedFoldersPath, { [workspace]: 'TRUST_FOLDER' });
+    writeJson(path.join(workspace, '.qwen', 'settings.json'), {
+      channels: {
+        runtime: {
+          type: 'plugin-example',
+          serverWsUrl: primaryServer.wsUrl,
+          senderPolicy: 'open',
+          sessionScope: 'user',
+          multiSession: true,
+          cwd: workspace,
+        },
+      },
+    });
+    const env = {
+      ...process.env,
+      QWEN_HOME: qwenHome,
+      QWEN_RUNTIME_DIR: runtimeDir,
+      QWEN_CODE_TRUSTED_FOLDERS_PATH: trustedFoldersPath,
+      SANDBOX_MOUNTS: REPO_ROOT,
+      OPENAI_API_KEY: 'fake-key',
+      OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
+      OPENAI_MODEL: 'fake-model',
+      QWEN_MODEL: 'fake-model',
+    };
+    const spawnDaemon = () =>
+      spawn(
+        process.execPath,
+        [
+          CLI_BIN,
+          'serve',
+          '--hostname',
+          '127.0.0.1',
+          '--port',
+          '0',
+          '--no-web',
+          '--token',
+          TOKEN,
+          '--workspace',
+          workspace,
+          '--initialize-timeout-ms',
+          String(ACP_INITIALIZE_TIMEOUT_MS),
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'], env },
+      );
+
+    daemon = spawnDaemon();
+    let port = await waitForListening(daemon);
+    let baseUrl = `http://127.0.0.1:${port}`;
+    const authHeaders = {
+      Authorization: `Bearer ${TOKEN}`,
+      'Content-Type': 'application/json',
+    };
+    const before = await fetch(`${baseUrl}/workspace/channel`, {
+      headers: authHeaders,
+    });
+    expect(await before.json()).toMatchObject({
+      enabled: false,
+      selection: null,
+      workers: [],
+    });
+
+    const enable = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({
+        selection: { mode: 'names', names: ['runtime'] },
+      }),
+    });
+    expect(enable.status).toBe(201);
+    await primaryServer.waitForConnection(15_000);
+    const running = await waitForRunningControl(baseUrl);
+    const firstPid = running.workers[0]?.pid;
+    expect(running).toMatchObject({
+      selection: { mode: 'names', names: ['runtime'] },
+      workers: [
+        expect.objectContaining({
+          workspaceCwd: workspace,
+          channels: ['runtime'],
+          state: 'running',
+        }),
+      ],
+    });
+
+    const aliceTarget = { senderId: 'alice', chatId: 'group-1' };
+    const bobTarget = { senderId: 'bob', chatId: 'group-1' };
+    await expect(
+      primaryServer.sendMessage('/session new review', aliceTarget),
+    ).resolves.toContain('Created and selected task "review"');
+    await expect(
+      primaryServer.sendMessage('/session new review', bobTarget),
+    ).resolves.toContain('Created and selected task "review"');
+    await expect(
+      primaryServer.sendMessage('/sessions all', aliceTarget),
+    ).resolves.toContain('* review (open, shared)');
+
+    await expect(
+      primaryServer.sendMessage('/session close review', aliceTarget),
+    ).resolves.toContain('No task is selected');
+    await expect(
+      primaryServer.sendMessage('/sessions', aliceTarget),
+    ).resolves.toBe('No open named tasks.');
+    await expect(
+      primaryServer.sendMessage('/sessions', bobTarget),
+    ).resolves.toContain('* review (open, shared)');
+    await expect(
+      primaryServer.sendMessage('/session use review', aliceTarget),
+    ).resolves.toContain('Selected task "review"');
+    await expect(
+      primaryServer.sendMessage('/session current', aliceTarget),
+    ).resolves.toContain('Current task: review');
+
+    const same = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({
+        selection: { mode: 'names', names: ['runtime'] },
+      }),
+    });
+    expect(same.status).toBe(200);
+    expect(await same.json()).toMatchObject({
+      changed: false,
+      state: { workers: [expect.objectContaining({ pid: firstPid })] },
+    });
+
+    const stop = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'DELETE',
+      headers: authHeaders,
+    });
+    expect(stop.status).toBe(200);
+    expect(await stop.json()).toMatchObject({
+      changed: true,
+      state: { enabled: false, selection: null, workers: [] },
+    });
+
+    await stopDaemon(daemon);
+    daemon = spawnDaemon();
+    port = await waitForListening(daemon);
+    baseUrl = `http://127.0.0.1:${port}`;
+    const afterRestart = await fetch(`${baseUrl}/workspace/channel`, {
+      headers: authHeaders,
+    });
+    expect(await afterRestart.json()).toMatchObject({
+      enabled: false,
+      selection: null,
+      workers: [],
+    });
+
+    const enableAfterRestart = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({
+        selection: { mode: 'names', names: ['runtime'] },
+      }),
+    });
+    expect(enableAfterRestart.status).toBe(201);
+    await primaryServer.waitForConnection(15_000);
+    await waitForRunningControl(baseUrl);
+    await expect(
+      primaryServer.sendMessage('/session use review', aliceTarget),
+    ).resolves.toContain('Selected task "review"');
+    await expect(
+      primaryServer.sendMessage('/session use review', bobTarget),
+    ).resolves.toContain('Selected task "review"');
+  }, 60_000);
+
+  it('returns partial startup failures from control and daemon status', async () => {
+    testRoot = realpathSync(
+      mkdtempSync(path.join(tmpdir(), 'qwen-serve-channel-partial-')),
+    );
+    const qwenHome = path.join(testRoot, 'qwen-home');
+    const runtimeDir = path.join(testRoot, 'runtime');
+    const workspace = path.join(testRoot, 'workspace');
+    mkdirSync(workspace);
+    mkdirSync(runtimeDir);
+    primaryServer = await createMockServer({ httpPort: 0, wsPort: 0 });
+    const unreachableWsUrl = await createClosedWebSocketUrl();
+
+    const extensionDir = path.join(qwenHome, 'extensions');
+    mkdirSync(extensionDir, { recursive: true });
+    symlinkSync(
+      path.join(REPO_ROOT, 'packages', 'channels', 'plugin-example'),
+      path.join(extensionDir, 'qwen-channel-plugin-example'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    writeJson(path.join(qwenHome, 'settings.json'), {
+      security: { folderTrust: { enabled: true } },
+    });
+    const trustedFoldersPath = path.join(qwenHome, 'trustedFolders.json');
+    writeJson(trustedFoldersPath, { [workspace]: 'TRUST_FOLDER' });
+    writeJson(path.join(workspace, '.qwen', 'settings.json'), {
+      channels: {
+        reachable: {
+          type: 'plugin-example',
+          serverWsUrl: primaryServer.wsUrl,
+          senderPolicy: 'open',
+          sessionScope: 'user',
+          cwd: workspace,
+        },
+        unreachable: {
+          type: 'plugin-example',
+          serverWsUrl: unreachableWsUrl,
+          senderPolicy: 'open',
+          sessionScope: 'user',
+          cwd: workspace,
+        },
+      },
+    });
+    daemon = spawn(
+      process.execPath,
+      [
+        CLI_BIN,
+        'serve',
+        '--hostname',
+        '127.0.0.1',
+        '--port',
+        '0',
+        '--no-web',
+        '--token',
+        TOKEN,
+        '--workspace',
+        workspace,
+        '--initialize-timeout-ms',
+        String(ACP_INITIALIZE_TIMEOUT_MS),
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          QWEN_HOME: qwenHome,
+          QWEN_RUNTIME_DIR: runtimeDir,
+          QWEN_CODE_TRUSTED_FOLDERS_PATH: trustedFoldersPath,
+          OPENAI_API_KEY: 'fake-key',
+          OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
+          OPENAI_MODEL: 'fake-model',
+          QWEN_MODEL: 'fake-model',
+        },
+      },
+    );
+    const port = await waitForListening(daemon);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const authHeaders = {
+      Authorization: `Bearer ${TOKEN}`,
+      'Content-Type': 'application/json',
+    };
+
+    const enable = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ selection: { mode: 'all' } }),
+    });
+    const enabled = (await enable.json()) as {
+      partial: boolean;
+      state: ChannelControlState;
+    };
+    expect(enable.status).toBe(201);
+    expect(enabled).toMatchObject({
+      partial: true,
+      state: {
+        workers: [
+          expect.objectContaining({
+            workspaceCwd: workspace,
+            state: 'running',
+            channels: ['reachable'],
+            startupFailures: [
+              expect.objectContaining({
+                channel: 'unreachable',
+                phase: 'connect',
+                code: 'ECONNREFUSED',
+                message: expect.stringMatching(/\S/u),
+              }),
+            ],
+          }),
+        ],
+      },
+    });
+    await primaryServer.waitForConnection(15_000);
+
+    const controlResponse = await fetch(`${baseUrl}/workspace/channel`, {
+      headers: authHeaders,
+    });
+    const control = (await controlResponse.json()) as ChannelControlState;
+    expect(control.workers[0]?.startupFailures).toEqual(
+      enabled.state.workers[0]?.startupFailures,
+    );
+
+    const statusResponse = await fetch(`${baseUrl}/daemon/status`, {
+      headers: authHeaders,
+    });
+    const status = (await statusResponse.json()) as ChannelWorkersStatus;
+    expect(status.runtime?.channelWorker).toMatchObject({
+      state: 'running',
+      channels: ['reachable'],
+      startupFailures: [
+        expect.objectContaining({
+          channel: 'unreachable',
+          phase: 'connect',
+          code: 'ECONNREFUSED',
+          message: expect.stringMatching(/\S/u),
+        }),
+      ],
+    });
+  }, 60_000);
+
+  it('returns attempted failures on 502 and does not retain them after rollback', async () => {
+    testRoot = realpathSync(
+      mkdtempSync(path.join(tmpdir(), 'qwen-serve-channel-failed-')),
+    );
+    const qwenHome = path.join(testRoot, 'qwen-home');
+    const runtimeDir = path.join(testRoot, 'runtime');
+    const workspace = path.join(testRoot, 'workspace');
+    mkdirSync(workspace);
+    mkdirSync(runtimeDir);
+    const unreachableWsUrl = await createClosedWebSocketUrl();
+
+    const extensionDir = path.join(qwenHome, 'extensions');
+    mkdirSync(extensionDir, { recursive: true });
+    symlinkSync(
+      path.join(REPO_ROOT, 'packages', 'channels', 'plugin-example'),
+      path.join(extensionDir, 'qwen-channel-plugin-example'),
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    writeJson(path.join(qwenHome, 'settings.json'), {
+      security: { folderTrust: { enabled: true } },
+    });
+    const trustedFoldersPath = path.join(qwenHome, 'trustedFolders.json');
+    writeJson(trustedFoldersPath, { [workspace]: 'TRUST_FOLDER' });
+    writeJson(path.join(workspace, '.qwen', 'settings.json'), {
+      channels: {
+        unreachable: {
+          type: 'plugin-example',
+          serverWsUrl: unreachableWsUrl,
+          senderPolicy: 'open',
+          sessionScope: 'user',
+          cwd: workspace,
+        },
+      },
+    });
+    daemon = spawn(
+      process.execPath,
+      [
+        CLI_BIN,
+        'serve',
+        '--hostname',
+        '127.0.0.1',
+        '--port',
+        '0',
+        '--no-web',
+        '--token',
+        TOKEN,
+        '--workspace',
+        workspace,
+        '--initialize-timeout-ms',
+        String(ACP_INITIALIZE_TIMEOUT_MS),
+      ],
+      {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          ...process.env,
+          QWEN_HOME: qwenHome,
+          QWEN_RUNTIME_DIR: runtimeDir,
+          QWEN_CODE_TRUSTED_FOLDERS_PATH: trustedFoldersPath,
+          OPENAI_API_KEY: 'fake-key',
+          OPENAI_BASE_URL: 'http://127.0.0.1:9/v1',
+          OPENAI_MODEL: 'fake-model',
+          QWEN_MODEL: 'fake-model',
+        },
+      },
+    );
+    const port = await waitForListening(daemon);
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const authHeaders = {
+      Authorization: `Bearer ${TOKEN}`,
+      'Content-Type': 'application/json',
+    };
+
+    const enable = await fetch(`${baseUrl}/workspace/channel`, {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ selection: { mode: 'all' } }),
+    });
+    const failed = (await enable.json()) as {
+      code: string;
+      rolledBack?: boolean;
+      state: ChannelControlState;
+      startupFailures?: ChannelStartupFailure[];
+    };
+    expect(enable.status).toBe(502);
+    expect(failed).toMatchObject({
+      code: 'channel_worker_start_failed',
+      rolledBack: true,
+      state: { enabled: false, workers: [] },
+      startupFailures: [
+        expect.objectContaining({
+          workspaceCwd: workspace,
+          channel: 'unreachable',
+          phase: 'connect',
+          code: 'ECONNREFUSED',
+          message: expect.stringMatching(/\S/u),
+        }),
+      ],
+    });
+
+    const currentResponse = await fetch(`${baseUrl}/workspace/channel`, {
+      headers: authHeaders,
+    });
+    const current = (await currentResponse.json()) as ChannelControlState;
+    expect(current).toMatchObject({
+      enabled: false,
+      selection: null,
+      transition: 'idle',
+      workers: [],
+    });
+    expect(JSON.stringify(current)).not.toContain('startupFailures');
+  }, 60_000);
+
   it('starts real workers for primary and secondary workspaces', async () => {
     testRoot = realpathSync(
       mkdtempSync(path.join(tmpdir(), 'qwen-serve-channel-workers-')),
@@ -232,6 +745,8 @@ describe('qwen serve multi-workspace channel workers', () => {
         'primary',
         '--channel',
         'secondary',
+        '--initialize-timeout-ms',
+        String(ACP_INITIALIZE_TIMEOUT_MS),
       ],
       {
         stdio: ['ignore', 'pipe', 'pipe'],

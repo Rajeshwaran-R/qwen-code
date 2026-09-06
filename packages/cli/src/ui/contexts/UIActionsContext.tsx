@@ -42,6 +42,7 @@ export interface UIActions {
     scope: SettingScope,
   ) => void;
   handleEffortSelect: (effort: ReasoningEffort | undefined) => void;
+  handleOutputStyleSelect: (styleName: string | undefined) => void;
   auth: AuthController['actions'];
   handleEditorSelect: (
     editorType: EditorType | undefined,
@@ -58,6 +59,7 @@ export interface UIActions {
     voiceModelMode?: boolean;
     visionModelMode?: boolean;
     compactionModelMode?: boolean;
+    imageModelMode?: boolean;
   }) => void;
   openArenaDialog: (type: Exclude<ArenaDialogType, null>) => void;
   closeArenaDialog: () => void;
@@ -75,10 +77,17 @@ export interface UIActions {
   onEscapePromptChange: (show: boolean) => void;
   onTabConsumerChange: (active: boolean) => void;
   refreshStatic: () => void;
-  handleFinalSubmit: (value: string) => void;
+  handleFinalSubmit: (
+    value: string,
+    options?: {
+      deferUntilIdle?: boolean;
+      submittedPrompt?: string;
+    },
+  ) => void;
   handleRetryLastPrompt: () => void;
   handleClearScreen: () => void;
   popAllQueuedMessages: () => string | null;
+  invalidateSubmittedPromptProvenance: () => void;
   // Welcome back dialog
   handleWelcomeBackSelection: (choice: 'continue' | 'restart') => void;
   handleWelcomeBackClose: () => void;

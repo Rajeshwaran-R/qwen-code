@@ -10,7 +10,7 @@ import { Box, Text } from 'ink';
 import { theme } from '../semantic-colors.js';
 import { useStreamingContext } from '../contexts/StreamingContext.js';
 import { StreamingState } from '../types.js';
-import { GeminiRespondingSpinner } from './GeminiRespondingSpinner.js';
+import { RespondingSpinner } from './RespondingSpinner.js';
 import { formatDuration, formatTokenCount } from '../utils/formatters.js';
 import { useTerminalSize } from '../hooks/useTerminalSize.js';
 import { useAnimationFrame } from '../hooks/useAnimationFrame.js';
@@ -90,11 +90,11 @@ export const LoadingIndicator: React.FC<LoadingIndicatorProps> = ({
   const showTokens = !isNarrow && outputTokens > 0;
   const tokenArrow = isReceivingContent ? '↓' : '↑';
 
-  // Fixed one-decimal width below the minute mark so the 0.5s-resolution
-  // ticks ("1s" vs "1.5s") don't shift the rest of the status line (#6402).
+  // Keep the timer's sub-second precision for rate calculations, but display
+  // only completed whole seconds in the status line.
   const timeStr =
     elapsedTime < 60
-      ? `${elapsedTime.toFixed(1)}s`
+      ? `${Math.floor(Math.max(0, elapsedTime))}s`
       : formatDuration(elapsedTime * 1000);
 
   const tokenStr = showTokens
@@ -126,7 +126,7 @@ export const LoadingIndicator: React.FC<LoadingIndicatorProps> = ({
       >
         <Box>
           <Box marginRight={1}>
-            <GeminiRespondingSpinner
+            <RespondingSpinner
               nonRespondingDisplay={
                 streamingState === StreamingState.WaitingForConfirmation
                   ? '⠏'

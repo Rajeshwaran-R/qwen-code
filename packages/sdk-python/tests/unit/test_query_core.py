@@ -576,6 +576,10 @@ async def test_set_effort_sends_control_request() -> None:
                     "subtype": "set_effort",
                     "effort": "high",
                     "applied": True,
+                    "override": {
+                        "source": "extra_body",
+                        "field": "thinking_budget",
+                    },
                 },
             },
         }
@@ -583,6 +587,42 @@ async def test_set_effort_sends_control_request() -> None:
 
     result = await task
     assert result is True
+    await query.close()
+
+
+@pytest.mark.asyncio
+async def test_set_effort_status_returns_override() -> None:
+    transport = FakeTransport()
+    query = await _start_query(transport)
+
+    task = asyncio.create_task(query.set_effort_status("max"))
+    request = await _wait_for_request(transport, "set_effort")
+    transport.push(
+        {
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request["request_id"],
+                "response": {
+                    "subtype": "set_effort",
+                    "effort": "max",
+                    "applied": False,
+                    "override": {
+                        "source": "extra_body",
+                        "field": "thinking_budget",
+                    },
+                },
+            },
+        }
+    )
+
+    assert await task == {
+        "applied": False,
+        "override": {
+            "source": "extra_body",
+            "field": "thinking_budget",
+        },
+    }
     await query.close()
 
 
@@ -694,10 +734,29 @@ async def test_initialize_sends_effort() -> None:
             "response": {
                 "subtype": "success",
                 "request_id": init_request["request_id"],
-                "response": {},
+                "response": {
+                    "effort_status": {
+                        "effort": "high",
+                        "applied": False,
+                        "override": {
+                            "source": "samplingParams",
+                            "field": "enable_thinking",
+                        },
+                        "reason": "samplingParams.enable_thinking takes precedence",
+                    }
+                },
             },
         }
     )
+    await query._initialize_task
+    assert query.initial_effort_status == {
+        "applied": False,
+        "override": {
+            "source": "samplingParams",
+            "field": "enable_thinking",
+        },
+        "reason": "samplingParams.enable_thinking takes precedence",
+    }
     await query.close()
 
 
@@ -755,3 +814,67 @@ def test_sync_next_after_exhaustion_raises_stop_iteration() -> None:
     # Third call must raise immediately, not block.
     with pytest.raises(StopIteration):
         next(sq)
+
+
+def test_fork_session_generates_new_session_id() -> None:
+    """fork_session=True should produce a session ID different from resume."""
+    from qwen_code_sdk.query import query as query_factory
+
+    resume_id = VALID_UUID
+    q = query_factory(
+        prompt="hello",
+        options=QueryOptions(fork_session=True, resume=resume_id),
+    )
+
+    assert q.get_session_id() != resume_id
+    import re
+
+    assert re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+        q.get_session_id(),
+    )
+
+
+def test_fork_session_uses_explicit_session_id() -> None:
+    """fork_session=True with session_id should use the explicit ID."""
+    from qwen_code_sdk.query import query as query_factory
+
+    resume_id = VALID_UUID
+    fork_id = "234e5678-e89b-12d3-a456-426614174001"
+    q = query_factory(
+        prompt="hello",
+        options=QueryOptions(
+            fork_session=True,
+            resume=resume_id,
+            session_id=fork_id,
+        ),
+    )
+
+    assert q.get_session_id() == fork_id
+    assert q.get_session_id() != resume_id
+
+
+def test_fork_session_unlocks_session_id() -> None:
+    """fork_session=True should not lock the session ID, allowing CLI to correct it."""
+    transport = FakeTransport()
+    query = Query(
+        transport=transport,  # type: ignore[arg-type]
+        options=QueryOptions(fork_session=True, resume=VALID_UUID),
+        prompt="hello",
+        session_id="234e5678-e89b-12d3-a456-426614174001",
+    )
+
+    assert query._session_id_locked is False
+
+
+def test_resume_locks_session_id() -> None:
+    """resume without fork_session should lock the session ID."""
+    transport = FakeTransport()
+    query = Query(
+        transport=transport,  # type: ignore[arg-type]
+        options=QueryOptions(resume=VALID_UUID),
+        prompt="hello",
+        session_id=VALID_UUID,
+    )
+
+    assert query._session_id_locked is True

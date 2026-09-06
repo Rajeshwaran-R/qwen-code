@@ -4,46 +4,75 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { Application, Request, Response } from 'express';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { HttpAcpBridge } from '@qwen-code/acp-bridge/bridgeTypes';
-import { RUNTIME_MCP_IF_ABSENT_CONFIG_FLAG } from '@qwen-code/qwen-code-core';
+import {
+  RUNTIME_MCP_IF_ABSENT_CONFIG_FLAG,
+  Storage,
+} from '@qwen-code/qwen-code-core';
+import { normalizeSessionIdForLookup } from '../../config/session-id.js';
 import { writeStderrLine } from '../../utils/stdioHelpers.js';
 import type { DaemonWorkspaceService } from '../workspace-service/types.js';
+import {
+  singleTokenCredentials,
+  type ListenerScopedCredentials,
+} from '../local-control/credentials.js';
+import { listenerIdentityOfSocket } from '../local-control/listener-identity.js';
 import type { WorkspaceFileSystemFactory } from '../fs/index.js';
 import { resolveAcpHttpEnabled } from '../acp-http-enabled.js';
 import type { DeviceFlowRegistry } from '../auth/device-flow.js';
 import type { ParsedAllowOriginPatterns } from '../auth.js';
-import { AcpDispatcher } from './dispatch.js';
+import { formatHostForAuthority, isLoopbackBind } from '../loopback-binds.js';
+import {
+  AcpDispatcher,
+  type LegacyStandaloneSessionRestorer,
+  type LiveSessionIsolation,
+} from './dispatch.js';
 import { WorkspaceRememberTaskLane } from '../workspace-remember.js';
 import type {
   WorkspaceRegistry,
   WorkspaceRuntime,
 } from '../workspace-registry.js';
+import { isInternalWorkspaceRuntime } from '../workspace-runtime-visibility.js';
 import {
-  resolveRegisteredWorkspaceRuntimeByPathSelector,
-  resolveWorkspaceRuntimeFromParam,
+  isPortableAbsolutePath,
+  resolveManagedWorkspaceRuntimeByPathSelector,
+  resolveWorkspaceEntryFromParam,
+  sendWorkspaceRuntimeUnavailable,
 } from '../workspace-route-runtime.js';
 import {
   ConnectionRegistry,
   type AcpConnection,
   type AcpConnectionDiagnostic,
 } from './connection-registry.js';
+import {
+  ACP_PRE_ATTACH_MAX_FRAMES_GLOBAL,
+  ACP_PRE_ATTACH_MAX_PAYLOAD_BYTES_GLOBAL,
+  AcpPreAttachBudget,
+  type AcpPreAttachBudgetSnapshot,
+} from './pre-attach-budget.js';
 import { SseStream } from './sse-stream.js';
 import { WsStream } from './ws-stream.js';
 import type { RateLimitTier } from '../rate-limit.js';
 import { SessionArchiveCoordinator } from '../server/session-archive.js';
+import type { RequestedSessionIdAdmission } from '../session-id-admission.js';
 import {
   RPC,
   error as rpcError,
+  isNotification,
   isRequest,
+  isResponse,
   logSafe,
   parseInbound,
+  type JsonRpcInbound,
 } from './json-rpc.js';
-import { parseLastEventId } from '../sse-last-event-id.js';
+import {
+  parseEventEpochHeader,
+  parseLastEventId,
+} from '../sse-last-event-id.js';
 import {
   ClientMcpWsConnection,
   type ClientMcpServerProvider,
@@ -70,9 +99,38 @@ export const ACP_SESSION_HEADER = 'acp-session-id';
 /** Pathname of the Plan C CDP-tunnel endpoint (issue #5626). */
 const CDP_PATH = '/cdp';
 
-/** Prefix/suffix of the Phase 4 workspace-qualified ACP WS path. */
-const PLURAL_ACP_WS_PREFIX = '/workspaces/';
+function isActiveDrainCorrelation(
+  registry: ConnectionRegistry,
+  conn: AcpConnection,
+  message: JsonRpcInbound,
+): boolean {
+  if (isResponse(message) && typeof message.id === 'string') {
+    const pending = registry.findPendingClientRequest(message.id);
+    return (
+      pending !== undefined &&
+      (pending.conn === conn || conn.ownsSession(pending.req.sessionId))
+    );
+  }
+  if (
+    !(isRequest(message) || isNotification(message)) ||
+    message.method !== 'session/cancel'
+  ) {
+    return false;
+  }
+  const params =
+    message.params !== null && typeof message.params === 'object'
+      ? (message.params as { sessionId?: unknown })
+      : undefined;
+  return (
+    typeof params?.sessionId === 'string' &&
+    conn.ownsSession(normalizeSessionIdForLookup(params.sessionId))
+  );
+}
+
+/** Prefix of workspace-qualified WebSocket routes. */
+const PLURAL_WS_PREFIX = '/workspaces/';
 const PLURAL_ACP_WS_SUFFIX = '/acp';
+const PLURAL_VOICE_WS_SUFFIX = '/voice/stream';
 
 /**
  * Extract the raw (undecoded, un-normalized) pathname from a request-target.
@@ -91,29 +149,29 @@ function rawRequestPathname(reqUrl: string | undefined): string {
 }
 
 /**
- * Match `/workspaces/<selector>/acp` (with an optional single trailing slash)
- * against a RAW request-target pathname and return the still-encoded selector,
- * or null when the shape does not match. Rejects empty selectors, extra path
- * segments (slash/backslash), and dot-segment traversal shapes -- including
- * percent-encoded variants -- so decoding afterwards can never reintroduce a
- * `/` or `..` that bypassed classification.
+ * Match `/workspaces/<selector><suffix>` (with an optional single trailing
+ * slash) against a RAW request-target pathname and return the still-encoded
+ * selector, or null when the shape does not match. Rejects empty selectors,
+ * extra path segments (slash/backslash), and dot-segment traversal shapes --
+ * including percent-encoded variants -- so decoding afterwards can never
+ * reintroduce a `/` or `..` that bypassed classification.
  */
-function pluralAcpRawSelector(rawPath: string): string | null {
+function pluralWorkspaceRawSelector(
+  rawPath: string,
+  suffix: string,
+): string | null {
   let p = rawPath;
-  if (p.endsWith(`${PLURAL_ACP_WS_SUFFIX}/`)) {
+  if (p.endsWith(`${suffix}/`)) {
     p = p.slice(0, -1);
   }
   if (
-    !p.startsWith(PLURAL_ACP_WS_PREFIX) ||
-    !p.endsWith(PLURAL_ACP_WS_SUFFIX) ||
-    p.length <= PLURAL_ACP_WS_PREFIX.length + PLURAL_ACP_WS_SUFFIX.length
+    !p.startsWith(PLURAL_WS_PREFIX) ||
+    !p.endsWith(suffix) ||
+    p.length <= PLURAL_WS_PREFIX.length + suffix.length
   ) {
     return null;
   }
-  const selector = p.slice(
-    PLURAL_ACP_WS_PREFIX.length,
-    p.length - PLURAL_ACP_WS_SUFFIX.length,
-  );
+  const selector = p.slice(PLURAL_WS_PREFIX.length, p.length - suffix.length);
   if (
     selector.length === 0 ||
     selector.includes('/') ||
@@ -170,6 +228,7 @@ function delay(ms: number): Promise<void> {
 function buildChromeDevToolsMcpRuntimeConfig(
   localPort: number | undefined,
   hostname: string | undefined,
+  env: Readonly<NodeJS.ProcessEnv>,
 ): Record<string, unknown> | undefined {
   if (
     localPort === undefined ||
@@ -178,7 +237,7 @@ function buildChromeDevToolsMcpRuntimeConfig(
   ) {
     return undefined;
   }
-  const command = resolveCdpMcpCommand(process.env);
+  const command = resolveCdpMcpCommand(env);
   if (!command) {
     writeStderrLine(
       `qwen serve: set ${QWEN_CDP_MCP_COMMAND_ENV} to enable browser automation MCP (no adapter is bundled)`,
@@ -265,7 +324,11 @@ const WS_READ_METHODS = new Set([
   '_qwen/session/supported_commands',
   '_qwen/session/context_usage',
   '_qwen/session/tasks',
+  '_qwen/session/agents',
+  '_qwen/session/agent_trace',
+  '_qwen/session/attachments',
   '_qwen/session/lsp',
+  '_qwen/session/saved_workflow',
   '_qwen/session/artifacts',
   '_qwen/workspace/mcp',
   '_qwen/workspace/skills',
@@ -294,7 +357,11 @@ const WS_READ_METHODS = new Set([
   '_qwen/file/glob',
 ]);
 
-function isSameLoopbackOrigin(origin: string, localPort?: number): boolean {
+function isSameLoopbackOrigin(
+  origin: string,
+  localPort?: number,
+  hostname?: string,
+): boolean {
   if (!localPort) return false;
   const parsed = new URL(origin);
   // Both schemes: under `--tls-cert/--tls-key` the loopback ACP client
@@ -307,13 +374,29 @@ function isSameLoopbackOrigin(origin: string, localPort?: number): boolean {
     `https://127.0.0.1:${localPort}`,
     `https://[::1]:${localPort}`,
   ]);
+  const boundHost =
+    hostname && isLoopbackBind(hostname)
+      ? formatHostForAuthority(hostname)
+      : undefined;
+  if (boundHost) {
+    allowed.add(`http://${boundHost}:${localPort}`);
+    allowed.add(`https://${boundHost}:${localPort}`);
+  }
   // RFC 7230 §5.4: browsers omit the port in the Origin header when it
-  // matches the scheme default (http→80, https→443). Accept the port-less
-  // forms so the check doesn't fail on default ports.
-  if (localPort === 80 || localPort === 443) {
+  // matches the scheme default (http→80, https→443).
+  if (localPort === 80) {
     for (const host of ['localhost', '127.0.0.1', '[::1]']) {
       allowed.add(`http://${host}`);
+    }
+    if (boundHost) {
+      allowed.add(`http://${boundHost}`);
+    }
+  } else if (localPort === 443) {
+    for (const host of ['localhost', '127.0.0.1', '[::1]']) {
       allowed.add(`https://${host}`);
+    }
+    if (boundHost) {
+      allowed.add(`https://${boundHost}`);
     }
   }
   return allowed.has(parsed.origin.toLowerCase());
@@ -329,6 +412,8 @@ const MAX_INFLIGHT_MCP_DISPATCH = 8;
 
 export interface MountAcpHttpOptions {
   boundWorkspace: string;
+  /** Process-level fallback for embedded mounts and parent-process runtimes. */
+  daemonEnv?: Readonly<NodeJS.ProcessEnv>;
   workspace: DaemonWorkspaceService;
   fsFactory?: WorkspaceFileSystemFactory;
   deviceFlowRegistry?: DeviceFlowRegistry;
@@ -337,6 +422,13 @@ export interface MountAcpHttpOptions {
   maxConnections?: number;
   /** Bearer token for WS auth (WS bypasses Express middleware). */
   token?: string;
+  /**
+   * Listener-scoped credentials. Supersedes `token` when set: the LAN listener
+   * attached by Local Control accepts a different credential than the primary
+   * one, which a single token cannot express. Falls back to `token` so callers
+   * that predate Local Control keep working unchanged.
+   */
+  credentials?: ListenerScopedCredentials;
   /**
    * Parsed `--allow-origin` allowlist. The WS CSRF check (CSWSH defence)
    * rejects non-loopback origins; origins in this allowlist are also accepted,
@@ -349,6 +441,12 @@ export interface MountAcpHttpOptions {
   /** Effective direct session shell policy for ACP initialize/dispatch. */
   sessionShellCommandEnabled?: boolean;
   archiveCoordinator?: SessionArchiveCoordinator;
+  /**
+   * The daemon-wide session-id admission shared with every other transport.
+   * Required: a mount-local fallback could not see draining generations, so
+   * the host must inject the shared instance (as `createServeApp` does).
+   */
+  requestedSessionIdAdmission: RequestedSessionIdAdmission;
   /** Shared lane for sessionless workspace remember tasks. */
   workspaceRememberLane: WorkspaceRememberTaskLane;
   /** Rate limit checker for WS messages (WS bypasses Express middleware). */
@@ -401,11 +499,20 @@ export interface MountAcpHttpOptions {
    * the primary runtime.
    */
   workspaceRegistry?: WorkspaceRegistry;
+  /** Live primary trust decision for legacy `/acp` operations. */
+  isPrimaryWorkspaceTrusted?: () => boolean;
   /**
    * Additional non-ACP WebSocket routes (e.g. `/voice/stream`) that reuse this
    * upgrade listener's security checks. Matched paths skip the ACP init flow.
    */
   extraWsRoutes?: readonly ExtraWsRoute[];
+  workspaceVoiceConnection?: (
+    runtime: WorkspaceRuntime,
+    ws: WebSocket,
+    req: IncomingMessage,
+  ) => void;
+  liveSessionIsolation?: LiveSessionIsolation;
+  standaloneSessionService?: LegacyStandaloneSessionRestorer;
 }
 
 /**
@@ -416,6 +523,8 @@ export interface MountAcpHttpOptions {
  */
 export interface ExtraWsRoute {
   path: string;
+  /** The route resolves its own workspace lifecycle instead of using primary. */
+  bypassPrimaryDrain?: boolean;
   onConnection: (ws: WebSocket, req: IncomingMessage) => void;
 }
 
@@ -437,6 +546,10 @@ interface RuntimeAcpMount {
   readonly rateLimitScope: string;
   readonly registry: ConnectionRegistry;
   readonly dispatcher: AcpDispatcher;
+  readonly workspaceRememberLane: WorkspaceRememberTaskLane;
+  readonly webSockets: Set<WebSocket>;
+  readonly pendingWebSockets: Set<WebSocket>;
+  draining: boolean;
   readonly ensureChromeDevToolsMcpRegistered: (
     localPort: number | undefined,
     originatorClientId: string,
@@ -463,6 +576,7 @@ export interface AcpHttpMountSnapshot {
   primary: boolean;
   connectionCount: number;
   wsStreams: number;
+  preAttachGuardFailures: number;
 }
 
 export interface AcpHttpConnectionDiagnostic extends AcpConnectionDiagnostic {
@@ -479,6 +593,10 @@ export interface AcpHttpSnapshot {
   sseStreams: number;
   wsStreams: number;
   pendingClientRequests: number;
+  bufferedConnectionFrames: number;
+  bufferedSessionFrames: number;
+  pendingDeliveryFrames: number;
+  preAttach: AcpPreAttachBudgetSnapshot;
   mounts: AcpHttpMountSnapshot[];
   connections: AcpHttpConnectionDiagnostic[];
 }
@@ -492,8 +610,46 @@ export interface AcpHttpHandle {
    * connections, not just the primary's.
    */
   getSnapshot(): AcpHttpSnapshot;
+  beginWorkspaceDrain(workspaceId: string): void;
+  cancelWorkspaceDrain(workspaceId: string): void;
+  getWorkspaceActivity(workspaceId: string): {
+    acpConnections: number;
+    memoryTasks: number;
+  };
+  /**
+   * Return the remember lane for a workspace, creating a secondary mount on
+   * demand for trusted non-primary runtimes. Returns undefined once the handle
+   * is disposed (callers answer 503) or for an unknown/untrusted runtime.
+   */
+  ensureWorkspaceRememberLane(
+    workspaceId: string,
+  ): WorkspaceRememberTaskLane | undefined;
+  /** Non-creating lane lookup for read routes; undefined when no mount exists. */
+  getWorkspaceRememberLane(
+    workspaceId: string,
+  ): WorkspaceRememberTaskLane | undefined;
+  /** Commit memory teardown while sockets remain open for terminal events. */
+  commitWorkspaceRemoval(workspaceId: string): void;
+  disposeWorkspace(workspaceId: string): void;
   /** Attach HTTP server post-listen to enable WebSocket upgrade. */
   attachServer(server: import('node:http').Server): void;
+  /**
+   * Stop serving upgrades on `server` and close the sockets already upgraded
+   * off it. Used when Local Control's LAN listener goes away; the primary
+   * listener is detached by `dispose()` instead.
+   */
+  detachServer(server: import('node:http').Server): void;
+}
+
+function runtimeEffectiveEnv(
+  runtime: WorkspaceRuntime,
+  daemonEnv: Readonly<NodeJS.ProcessEnv>,
+): Readonly<NodeJS.ProcessEnv> {
+  if (runtime.env.mode === 'runtime-overlay') {
+    // An empty overlay must stay isolated instead of inheriting daemon values.
+    return runtime.env.effectiveEnv ?? {};
+  }
+  return runtime.env.effectiveEnv ?? daemonEnv;
 }
 
 /**
@@ -516,7 +672,22 @@ export function mountAcpHttp(
   const enabled = opts.enabled ?? resolveAcpHttpEnabled();
   if (!enabled) return undefined;
 
+  const daemonEnv = opts.daemonEnv ?? process.env;
+  const primarySessionRuntimeBaseDir =
+    opts.workspaceRegistry?.primary.sessionRuntimeBaseDir ??
+    Storage.getRuntimeBaseDir();
+  const archiveCoordinator =
+    opts.archiveCoordinator ?? new SessionArchiveCoordinator();
+  const requestedSessionIdAdmission = opts.requestedSessionIdAdmission;
+  const getPrimaryEnv = () =>
+    opts.workspaceRegistry
+      ? runtimeEffectiveEnv(opts.workspaceRegistry.primary, daemonEnv)
+      : daemonEnv;
   const path = opts.path ?? '/acp';
+  const preAttachBudget = new AcpPreAttachBudget({
+    maxFrames: ACP_PRE_ATTACH_MAX_FRAMES_GLOBAL,
+    maxBytes: ACP_PRE_ATTACH_MAX_PAYLOAD_BYTES_GLOBAL,
+  });
   const dispatcherRef: { current?: AcpDispatcher } = {};
   // Lifecycle gate: once `dispose()` runs, late/in-flight HTTP requests get a
   // 503 instead of racing torn-down registries (issue #6378 daemon shutdown).
@@ -526,6 +697,20 @@ export function mountAcpHttp(
     res.status(503).json({
       error: 'ACP HTTP transport has been disposed',
       code: 'server_disposed',
+    });
+    return true;
+  };
+  const rejectIfUnavailable = (
+    mount: RuntimeAcpMount,
+    res: Response,
+  ): boolean => {
+    if (rejectIfDisposed(res)) return true;
+    if (!mount.draining) return false;
+    res.set('Retry-After', '5');
+    res.status(503).json({
+      error: 'Workspace runtime is being removed',
+      code: 'workspace_draining',
+      workspaceCwd: mount.workspaceCwd,
     });
     return true;
   };
@@ -558,6 +743,8 @@ export function mountAcpHttp(
       });
     },
     opts.maxConnections,
+    undefined,
+    preAttachBudget,
   );
   let cdpMcpRegistered = false;
   let cdpMcpRegistering: Promise<void> | undefined;
@@ -616,6 +803,7 @@ export function mountAcpHttp(
     const runtimeConfig = buildChromeDevToolsMcpRuntimeConfig(
       localPort,
       opts.hostname,
+      daemonEnv,
     );
     if (!runtimeConfig) {
       cdpMcpTerminalSkipLogged = true;
@@ -683,13 +871,41 @@ export function mountAcpHttp(
   const dispatcher = new AcpDispatcher(
     bridge,
     opts.boundWorkspace,
+    getPrimaryEnv,
     opts.workspace,
     opts.workspaceRememberLane,
+    requestedSessionIdAdmission,
     opts.fsFactory,
     opts.deviceFlowRegistry,
     opts.sessionShellCommandEnabled === true,
     registry,
-    opts.archiveCoordinator ?? new SessionArchiveCoordinator(),
+    archiveCoordinator,
+    opts.isPrimaryWorkspaceTrusted ??
+      (() => {
+        const entry = opts.workspaceRegistry?.primaryEntry;
+        return entry
+          ? entry.state === 'active' && entry.current?.runtime.trusted === true
+          : true;
+      }),
+    () => {
+      const guard = opts.workspaceRegistry?.primaryEntry.current?.guard;
+      return guard ? () => guard.assertOpen() : undefined;
+    },
+    undefined,
+    primarySessionRuntimeBaseDir,
+    () => {
+      const runtime = opts.workspaceRegistry?.primary;
+      return runtime
+        ? {
+            bridge: runtime.bridge,
+            sessionRuntimeBaseDir: runtime.sessionRuntimeBaseDir,
+            workspaceId: runtime.workspaceId,
+          }
+        : {
+            bridge,
+            sessionRuntimeBaseDir: primarySessionRuntimeBaseDir,
+          };
+    },
   );
   dispatcherRef.current = dispatcher;
 
@@ -703,6 +919,10 @@ export function mountAcpHttp(
     rateLimitScope: opts.workspaceRegistry?.primary.workspaceId ?? 'primary',
     registry,
     dispatcher,
+    workspaceRememberLane: opts.workspaceRememberLane,
+    webSockets: new Set(),
+    pendingWebSockets: new Set(),
+    draining: false,
     ensureChromeDevToolsMcpRegistered,
     removeChromeDevToolsMcpIfUnused,
     clientMcpProviderFactory: opts.clientMcpProviderFactory,
@@ -715,17 +935,17 @@ export function mountAcpHttp(
     req: Request,
     res: Response,
   ): void => {
-    if (rejectIfDisposed(res)) return;
+    if (rejectIfUnavailable(mount, res)) return;
     const connectionId = headerOf(req, ACP_CONNECTION_HEADER);
     if (!connectionId) {
       res.status(400).json({ error: 'Missing Acp-Connection-Id' });
       return;
     }
-    // NOTE: like every other route, DELETE is gated only by the bearer
-    // token — the daemon's trust boundary is "holds the token for this
-    // daemon", so any token-holder may tear down any connection (same posture
+    // NOTE: like every other route, DELETE is gated by deployment-level
+    // operator authority, not by ownership of this ACP connection. Any
+    // authorized caller may therefore tear down any connection (same posture
     // as the REST `DELETE /session/:id`). A per-connection secret would add
-    // intra-token isolation; deferred with the rest of the multi-tenant
+    // intra-operator isolation; deferred with the rest of the multi-tenant
     // hardening (design §7).
     const existed = mount.registry.delete(connectionId);
     if (existed) {
@@ -765,6 +985,18 @@ export function mountAcpHttp(
       return;
     }
     const message = parsed.message;
+    const cleanupMessage =
+      (isRequest(message) || isNotification(message)) &&
+      message.method === 'session/cancel';
+    if (mount.draining && !isResponse(message) && !cleanupMessage) {
+      res.set('Retry-After', '5');
+      res.status(503).json({
+        error: 'Workspace runtime is being removed',
+        code: 'workspace_draining',
+        workspaceCwd: mount.workspaceCwd,
+      });
+      return;
+    }
 
     // `initialize` mints a connection and replies inline (200 + JSON).
     if (isRequest(message) && message.method === 'initialize') {
@@ -835,6 +1067,17 @@ export function mountAcpHttp(
         );
       return;
     }
+    if (mount.draining) {
+      if (!isActiveDrainCorrelation(mount.registry, conn, message)) {
+        res.set('Retry-After', '5');
+        res.status(503).json({
+          error: 'Workspace runtime is being removed',
+          code: 'workspace_draining',
+          workspaceCwd: mount.workspaceCwd,
+        });
+        return;
+      }
+    }
 
     // Rate limit ACP HTTP POST (mirrors the WS checkRate path).
     if (opts.checkRate && isRequest(message)) {
@@ -893,7 +1136,7 @@ export function mountAcpHttp(
     req: Request,
     res: Response,
   ): void => {
-    if (rejectIfDisposed(res)) return;
+    if (rejectIfUnavailable(mount, res)) return;
     // RFD: Accept MUST include text/event-stream; otherwise 406.
     const accept = req.headers['accept'] ?? '';
     if (!accept.includes('text/event-stream')) {
@@ -912,7 +1155,10 @@ export function mountAcpHttp(
       res.status(404).json({ error: 'Unknown Acp-Connection-Id' });
       return;
     }
-    const sessionId = headerOf(req, ACP_SESSION_HEADER);
+    const rawSessionId = headerOf(req, ACP_SESSION_HEADER);
+    const sessionId = rawSessionId
+      ? normalizeSessionIdForLookup(rawSessionId)
+      : undefined;
 
     if (!sessionId) {
       // Connection-scoped stream. onClose logs the disconnect so a
@@ -995,9 +1241,6 @@ export function mountAcpHttp(
       },
       () => conn.touch(),
     );
-    // Open (write SSE headers + `retry:`) BEFORE attaching, so the protocol
-    // handshake precedes any buffered frames the attach flushes.
-    stream.open();
     // Resume cursor: an EventSource/SSE client auto-resends the last `id:` it
     // saw as `Last-Event-ID` on reconnect. Drives the EventBus ring replay so
     // content frames produced during a mid-turn proxy gap are recovered (§1.8).
@@ -1005,6 +1248,23 @@ export function mountAcpHttp(
       headerOf(req, 'last-event-id'),
       '/acp ',
     );
+    // Epoch token paired with the resume cursor (DAEMON-001). Invalid values
+    // degrade to "not provided" so the bus falls back to the numeric
+    // stale-cursor heuristic.
+    const eventEpoch = parseEventEpochHeader(
+      headerOf(req, 'x-qwen-event-epoch'),
+      '/acp ',
+    );
+    // Advertise the current bus epoch BEFORE `stream.open()` flushes headers
+    // so every subscription (including the first, cursor-less one) learns the
+    // epoch to pair with its resume cursor on later reconnects.
+    const busEpoch = mount.dispatcher.getSessionEventEpoch(sessionId);
+    if (busEpoch !== undefined) {
+      res.setHeader('X-Qwen-Event-Epoch', busEpoch);
+    }
+    // Open (write SSE headers + `retry:`) BEFORE attaching, so the protocol
+    // handshake precedes any buffered frames the attach flushes.
+    stream.open();
     // Pass the resume cursor INTO attach: when resuming, attach skips flushing
     // id-bearing buffered frames because the ring replay below redelivers every
     // bus event after `lastEventId` exactly once — including any frame lost
@@ -1055,7 +1315,7 @@ export function mountAcpHttp(
       }
     };
     void mount.dispatcher
-      .pumpSessionEvents(conn, sessionId, ac.signal, lastEventId)
+      .pumpSessionEvents(conn, sessionId, ac.signal, lastEventId, eventEpoch)
       .then(onPumpSettled, (err: unknown) => {
         writeStderrLine(
           `qwen serve: ${mount.routeLabel} event pump error (${logSafe(sessionId)}, lastEventId=${
@@ -1102,12 +1362,27 @@ export function mountAcpHttp(
           });
       },
       opts.maxConnections,
+      undefined,
+      preAttachBudget,
     );
+    const workspaceRememberLane = new WorkspaceRememberTaskLane(
+      rt.bridge,
+      rt.workspaceCwd,
+    );
+    const registeredGeneration = opts.workspaceRegistry?.getEntryByWorkspaceId(
+      rt.workspaceId,
+    )?.current;
+    const generationGuard =
+      registeredGeneration?.runtime === rt
+        ? registeredGeneration.guard
+        : rt.generationGuard;
     const secondaryDispatcher = new AcpDispatcher(
       rt.bridge,
       rt.workspaceCwd,
+      () => runtimeEffectiveEnv(rt, daemonEnv),
       rt.workspaceService,
-      new WorkspaceRememberTaskLane(rt.bridge),
+      workspaceRememberLane,
+      requestedSessionIdAdmission,
       rt.routeFileSystemFactory,
       // Phase 4: secondary mounts share the daemon-global device-flow registry
       // (single instance per daemon; OAuth credentials are global state). The
@@ -1117,7 +1392,21 @@ export function mountAcpHttp(
       opts.deviceFlowRegistry,
       opts.sessionShellCommandEnabled === true,
       secondaryRegistry,
-      opts.archiveCoordinator ?? new SessionArchiveCoordinator(),
+      archiveCoordinator,
+      () => rt.trusted,
+      () => (generationGuard ? () => generationGuard.assertOpen() : undefined),
+      rt.provenance === 'live-conversation'
+        ? opts.liveSessionIsolation
+        : undefined,
+      rt.sessionRuntimeBaseDir,
+      () => ({
+        bridge: rt.bridge,
+        sessionRuntimeBaseDir: rt.sessionRuntimeBaseDir,
+        workspaceId: rt.workspaceId,
+      }),
+      rt.provenance === 'live-conversation'
+        ? opts.standaloneSessionService
+        : undefined,
     );
     secondaryDispatcherRef.current = secondaryDispatcher;
     return {
@@ -1127,6 +1416,10 @@ export function mountAcpHttp(
       rateLimitScope: rt.workspaceId,
       registry: secondaryRegistry,
       dispatcher: secondaryDispatcher,
+      workspaceRememberLane,
+      webSockets: new Set(),
+      pendingWebSockets: new Set(),
+      draining: false,
       ensureChromeDevToolsMcpRegistered: () => {},
       removeChromeDevToolsMcpIfUnused: () => {},
       // Reverse client-MCP over WS is per-runtime: a connection on this
@@ -1146,13 +1439,27 @@ export function mountAcpHttp(
   };
 
   const secondaryMounts = new Map<string, RuntimeAcpMount>();
+  const drainingWorkspaceIds = new Set<string>();
+  const primaryWorkspaceId = opts.workspaceRegistry?.primaryEntry.workspaceId;
+  const mountForWorkspace = (
+    workspaceId: string,
+  ): RuntimeAcpMount | undefined =>
+    workspaceId === primaryWorkspaceId
+      ? primaryMount
+      : secondaryMounts.get(workspaceId);
   const getOrCreateSecondaryMount = (
     rt: WorkspaceRuntime,
   ): RuntimeAcpMount | undefined => {
-    if (rt.primary || !rt.trusted) return undefined;
+    if (rt.primary || !rt.trusted || isInternalWorkspaceRuntime(rt)) {
+      return undefined;
+    }
     const existing = secondaryMounts.get(rt.workspaceId);
     if (existing) return existing;
     const mount = createSecondaryAcpMount(rt);
+    if (drainingWorkspaceIds.has(rt.workspaceId)) {
+      mount.draining = true;
+      mount.workspaceRememberLane.beginDrain();
+    }
     secondaryMounts.set(rt.workspaceId, mount);
     return mount;
   };
@@ -1182,8 +1489,13 @@ export function mountAcpHttp(
       });
       return null;
     }
-    const rt = resolveWorkspaceRuntimeFromParam(workspaceRegistry, req, res);
-    if (!rt) return null;
+    const entry = resolveWorkspaceEntryFromParam(workspaceRegistry, req, res);
+    if (!entry) return null;
+    const rt = entry.current?.runtime;
+    if (!rt || (entry.state !== 'active' && entry.state !== 'draining')) {
+      sendWorkspaceRuntimeUnavailable(res, entry);
+      return null;
+    }
     if (!rt.primary && !rt.trusted) {
       res.status(403).json({
         error: `Workspace "${rt.workspaceCwd}" is not trusted.`,
@@ -1232,10 +1544,25 @@ export function mountAcpHttp(
   let upgradeListener:
     | ((req: IncomingMessage, socket: Duplex, head: Buffer) => void)
     | undefined;
-  let upgradeServer: import('node:http').Server | undefined;
+  // A Set, not a single server: while Local Control is on, the same app is
+  // served by both the primary listener and the LAN listener, and each needs
+  // its own `'upgrade'` registration. The `ExtraWsRoute` invariant is
+  // unchanged — still exactly ONE listener per server, and still this one.
+  const upgradeServers = new Set<import('node:http').Server>();
+  const upgradeCredentials =
+    opts.credentials ?? singleTokenCredentials(opts.token);
 
   function setupWebSocket(httpServer: import('node:http').Server): void {
-    if (disposed || wss) return;
+    if (disposed || upgradeServers.has(httpServer)) return;
+    if (wss) {
+      // The `WebSocketServer` is `noServer: true` and therefore server-
+      // agnostic, so a second listener reuses it rather than building a
+      // parallel one — which would give the LAN its own client set, its own
+      // `maxPayload`, and its own shutdown path to get wrong.
+      upgradeServers.add(httpServer);
+      httpServer.on('upgrade', upgradeListener!);
+      return;
+    }
     wss = new WebSocketServer({
       noServer: true,
       maxPayload: 10 * 1024 * 1024,
@@ -1255,10 +1582,7 @@ export function mountAcpHttp(
         return false;
       },
     });
-    upgradeServer = httpServer;
-    const expectedTokenHash = opts.token
-      ? createHash('sha256').update(opts.token).digest()
-      : undefined;
+    upgradeServers.add(httpServer);
 
     upgradeListener = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
       if (disposed) {
@@ -1282,7 +1606,8 @@ export function mountAcpHttp(
       // rather than `url.pathname`. WHATWG URL normalizes dot-segments, so
       // `/workspaces/%2e%2e/acp` would collapse to `/acp` and silently bind to
       // the primary mount. `rawRequestPathname` keeps it un-normalized and
-      // `pluralAcpRawSelector` rejects traversal / backslash / empty selectors.
+      // `pluralWorkspaceRawSelector` rejects traversal / backslash / empty
+      // selectors for both ACP and Voice workspace-qualified routes.
       const rawPath = rawRequestPathname(req.url);
       const isCdpPath =
         opts.cdpTunnelOverWs === true &&
@@ -1292,30 +1617,59 @@ export function mountAcpHttp(
         (route) => route.path === rawPath,
       );
       const pluralRawSelector = workspaceQualifiedAcpEnabled
-        ? pluralAcpRawSelector(rawPath)
+        ? pluralWorkspaceRawSelector(rawPath, PLURAL_ACP_WS_SUFFIX)
         : null;
       const isPluralAcpShape = pluralRawSelector !== null;
-      if (rawPath !== path && !isCdpPath && !extraRoute && !isPluralAcpShape) {
+      const pluralVoiceRawSelector = opts.workspaceVoiceConnection
+        ? pluralWorkspaceRawSelector(rawPath, PLURAL_VOICE_WS_SUFFIX)
+        : null;
+      const isPluralVoiceShape = pluralVoiceRawSelector !== null;
+      if (
+        rawPath !== path &&
+        !isCdpPath &&
+        !extraRoute &&
+        !isPluralAcpShape &&
+        !isPluralVoiceShape
+      ) {
         logReject(`unknown-path ${logSafe(rawPath)}`);
         socket.destroy();
         return;
       }
 
       const fromLoopback = isLoopbackSocket(socket);
+      const upgradeListenerIdentity = listenerIdentityOfSocket(socket);
+      const host = (req.headers['host'] ?? '').toLowerCase();
 
       // Host allowlist: mirror REST surface's hostAllowlist middleware
       // (auth.ts:196). Prevents DNS-rebinding attacks where a malicious
       // domain resolves to 127.0.0.1 and the browser sends the
       // attacker's Host header. Match the full host:port string like
       // the REST middleware does; extract port from the socket.
-      if (fromLoopback) {
-        const host = (req.headers['host'] ?? '').toLowerCase();
+      if (upgradeListenerIdentity.kind === 'local-control') {
+        const authority = upgradeListenerIdentity.authority;
+        const browserHost =
+          upgradeListenerIdentity.origin === undefined
+            ? undefined
+            : new URL(upgradeListenerIdentity.origin).host.toLowerCase();
+        if (
+          authority === undefined ||
+          (host !== authority && host !== browserHost)
+        ) {
+          logReject(`host-not-allowed ${host || '(missing)'}`);
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      } else if (fromLoopback) {
         const allowed = new Set([
           `localhost:${localPort}`,
           `127.0.0.1:${localPort}`,
           `[::1]:${localPort}`,
           `host.docker.internal:${localPort}`,
         ]);
+        if (opts.hostname && isLoopbackBind(opts.hostname)) {
+          allowed.add(`${formatHostForAuthority(opts.hostname)}:${localPort}`);
+        }
         // RFC 7230 §5.4: browsers omit the port suffix when it matches the
         // scheme default (http→80, https→443). On TLS/port 443 the browser
         // sends `Host: localhost`, which won't match `localhost:443` and
@@ -1326,6 +1680,9 @@ export function mountAcpHttp(
           allowed.add('127.0.0.1');
           allowed.add('[::1]');
           allowed.add('host.docker.internal');
+          if (opts.hostname && isLoopbackBind(opts.hostname)) {
+            allowed.add(formatHostForAuthority(opts.hostname));
+          }
         }
         if (!allowed.has(host)) {
           logReject(`host-not-allowed ${host || '(missing)'}`);
@@ -1341,7 +1698,11 @@ export function mountAcpHttp(
       const origin = req.headers['origin'];
       if (origin) {
         try {
-          const isLoopbackOrigin = isSameLoopbackOrigin(origin, localPort);
+          const isLoopbackOrigin = isSameLoopbackOrigin(
+            origin,
+            localPort,
+            opts.hostname,
+          );
           // `--allow-origin` allowlist (same match semantics as the REST
           // `allowOriginCors`): lets an explicitly permitted non-loopback
           // origin — e.g. a browser extension's `chrome-extension://<id>`
@@ -1349,7 +1710,10 @@ export function mountAcpHttp(
           const isAllowlistedOrigin =
             opts.allowedOrigins !== undefined &&
             opts.allowedOrigins.origins.has(origin.toLowerCase());
-          if (!isLoopbackOrigin && !isAllowlistedOrigin) {
+          const isListenerOrigin =
+            upgradeListenerIdentity.kind === 'local-control' &&
+            upgradeListenerIdentity.origin === origin.toLowerCase();
+          if (!isLoopbackOrigin && !isAllowlistedOrigin && !isListenerOrigin) {
             logReject(`origin-not-allowed ${origin}`);
             socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
             socket.destroy();
@@ -1365,19 +1729,20 @@ export function mountAcpHttp(
 
       // Auth: WS bypasses Express middleware. Same posture as REST:
       // loopback without token = allow; non-loopback/token-mismatch = reject.
-      if (opts.token) {
+      //
+      // Scoped to the listener the upgrade arrived on, exactly as the REST
+      // gate is: an upgrade reaching the LAN listener must carry the pairing
+      // credential, and the runtime token does not satisfy it. Without this
+      // the subprotocol path would be a way around the scoping that
+      // `bearerAuth` enforces for plain HTTP.
+      if (!upgradeCredentials.isOpen(upgradeListenerIdentity)) {
         // Accept the token from `Authorization` (non-browser clients) or the
         // `qwen-bearer.*` subprotocol (browsers, which can't set Authorization
         // on a WebSocket). Hash-compare in constant time, same posture as REST.
-        const credentials = extractUpgradeBearer(req);
-        const actual = credentials
-          ? createHash('sha256').update(credentials).digest()
-          : undefined;
+        const presented = extractUpgradeBearer(req);
         if (
-          !actual ||
-          !expectedTokenHash ||
-          actual.length !== expectedTokenHash.length ||
-          !timingSafeEqual(expectedTokenHash, actual)
+          !presented ||
+          !upgradeCredentials.verify(presented, upgradeListenerIdentity)
         ) {
           logReject('auth-mismatch');
           socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -1403,6 +1768,54 @@ export function mountAcpHttp(
         return;
       }
 
+      if (isPluralVoiceShape) {
+        let selector: string;
+        try {
+          selector = decodeURIComponent(pluralVoiceRawSelector!);
+        } catch {
+          logReject('workspace-selector-decode-error');
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const wsRegistry = opts.workspaceRegistry;
+        const runtime = wsRegistry
+          ? (wsRegistry.getManagedByWorkspaceId(selector) ??
+            (isPortableAbsolutePath(selector)
+              ? resolveManagedWorkspaceRuntimeByPathSelector(
+                  wsRegistry,
+                  selector,
+                )
+              : undefined))
+          : undefined;
+        if (!runtime) {
+          logReject(`workspace-mismatch ${logSafe(selector)}`);
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        if (isInternalWorkspaceRuntime(runtime)) {
+          logReject(`workspace-mismatch ${logSafe(selector)}`);
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        if (!runtime.trusted) {
+          logReject(`untrusted-workspace ${runtime.workspaceId}`);
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        wss!.handleUpgrade(req, socket, head, (ws: WebSocket) => {
+          if (disposed) {
+            ws.close(1012, 'Server shutting down');
+            return;
+          }
+          opts.workspaceVoiceConnection!(runtime, ws, req);
+        });
+        return;
+      }
+
       // ── Phase 4: resolve the target ACP mount for this upgrade ──
       // Legacy `/acp` binds to the primary mount; `/workspaces/:workspace/acp`
       // resolves the registered runtime's mount. The shared security checks
@@ -1422,16 +1835,39 @@ export function mountAcpHttp(
           return;
         }
         const wsRegistry = opts.workspaceRegistry;
-        const rt = wsRegistry
-          ? (wsRegistry.getByWorkspaceId(selector) ??
-            resolveRegisteredWorkspaceRuntimeByPathSelector(
-              wsRegistry,
-              selector,
-            ))
-          : undefined;
+        if (!wsRegistry) {
+          logReject(`workspace-mismatch ${logSafe(selector)}`);
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const rt =
+          wsRegistry.getManagedByWorkspaceId(selector) ??
+          (isPortableAbsolutePath(selector)
+            ? resolveManagedWorkspaceRuntimeByPathSelector(wsRegistry, selector)
+            : undefined);
         if (!rt) {
           logReject(`workspace-mismatch ${logSafe(selector)}`);
           socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        if (isInternalWorkspaceRuntime(rt)) {
+          logReject(`workspace-mismatch ${logSafe(selector)}`);
+          socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+        const entry = wsRegistry.getEntryByWorkspaceId(rt.workspaceId);
+        if (
+          !entry ||
+          (entry.state !== 'active' && entry.state !== 'draining') ||
+          entry.current?.runtime !== rt
+        ) {
+          logReject(`workspace-unavailable ${rt.workspaceId}`);
+          socket.write(
+            'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\n\r\n',
+          );
           socket.destroy();
           return;
         }
@@ -1453,6 +1889,15 @@ export function mountAcpHttp(
         activeMount = resolvedMount;
       }
 
+      if (extraRoute?.bypassPrimaryDrain !== true && activeMount.draining) {
+        logReject(`workspace-draining ${activeMount.routeLabel}`);
+        socket.write(
+          'HTTP/1.1 503 Service Unavailable\r\nRetry-After: 5\r\n\r\n',
+        );
+        socket.destroy();
+        return;
+      }
+
       wss!.handleUpgrade(req, socket, head, (ws: WebSocket) => {
         if (disposed) {
           ws.close(1012, 'Server shutting down');
@@ -1464,6 +1909,8 @@ export function mountAcpHttp(
           extraRoute.onConnection(ws, req);
           return;
         }
+        activeMount.webSockets.add(ws);
+        activeMount.pendingWebSockets.add(ws);
         let initialized = false;
         const initTimer = setTimeout(() => {
           if (!initialized) {
@@ -1504,6 +1951,8 @@ export function mountAcpHttp(
         // the socket goes away. WsStream's onClose handles ACP teardown.
         ws.on('close', () => {
           clearTimeout(initTimer);
+          activeMount.webSockets.delete(ws);
+          activeMount.pendingWebSockets.delete(ws);
           if (clientMcp) {
             void clientMcp.dispose('WS closed').catch(() => {});
             clientMcp = undefined;
@@ -1558,6 +2007,59 @@ export function mountAcpHttp(
               JSON.stringify({
                 error: 'Batch JSON-RPC not supported',
               }),
+            );
+            return;
+          }
+
+          const frameType =
+            parsed !== null && typeof parsed === 'object'
+              ? (parsed as { type?: unknown }).type
+              : undefined;
+          if (
+            activeMount.draining &&
+            frameType === 'mcp_message' &&
+            clientMcp !== undefined &&
+            parsed !== null &&
+            typeof parsed === 'object'
+          ) {
+            // Only replies to requests pending on this connection resolve here.
+            const result = await clientMcp.handleFrame(
+              parsed as Record<string, unknown>,
+            );
+            if (result.kind === 'message_resolved') return;
+          }
+          if (
+            activeMount.draining &&
+            !(
+              connRef !== undefined &&
+              (isResponse(parsed) ||
+                isRequest(parsed) ||
+                isNotification(parsed)) &&
+              isActiveDrainCorrelation(activeMount.registry, connRef, parsed)
+            )
+          ) {
+            if (
+              opts.cdpTunnelOverWs === true &&
+              cdpEndpoint !== undefined &&
+              parsed !== null &&
+              typeof parsed === 'object' &&
+              isCdpInboundFrameType(frameType) &&
+              cdpEndpoint.routeInbound(parsed as Record<string, unknown>)
+            ) {
+              return;
+            }
+            ws.send(
+              JSON.stringify(
+                rpcError(
+                  isRequest(parsed) ? parsed.id : null,
+                  RPC.INTERNAL_ERROR,
+                  'Workspace runtime is being removed',
+                  {
+                    code: 'workspace_draining',
+                    workspaceCwd: activeMount.workspaceCwd,
+                  },
+                ),
+              ),
             );
             return;
           }
@@ -1821,6 +2323,7 @@ export function mountAcpHttp(
             );
 
             initialized = true;
+            activeMount.pendingWebSockets.delete(ws);
             clearTimeout(initTimer);
             connRef = conn;
             writeStderrLine(
@@ -1886,9 +2389,13 @@ export function mountAcpHttp(
             message.params &&
             typeof message.params === 'object'
           ) {
-            const sid = (message.params as Record<string, unknown>)[
+            const rawSid = (message.params as Record<string, unknown>)[
               'sessionId'
             ];
+            const sid =
+              typeof rawSid === 'string'
+                ? normalizeSessionIdForLookup(rawSid)
+                : rawSid;
             if (typeof sid === 'string' && conn.ownsSession(sid)) {
               const binding = conn.sessions.get(sid);
               if (
@@ -1974,17 +2481,22 @@ export function mountAcpHttp(
     dispose: () => {
       if (disposed) return;
       disposed = true;
-      if (upgradeServer && upgradeListener) {
-        upgradeServer.removeListener('upgrade', upgradeListener);
+      if (upgradeListener) {
+        for (const server of upgradeServers) {
+          server.removeListener('upgrade', upgradeListener);
+        }
+        upgradeServers.clear();
         upgradeListener = undefined;
-        upgradeServer = undefined;
       }
       registry.dispose();
+      opts.workspaceRememberLane.dispose();
       // Phase 4: dispose every non-primary runtime's ACP connection registry too,
       // so their sweep timers + live connections are torn down on shutdown.
       for (const mount of secondaryMounts.values()) {
+        mount.workspaceRememberLane.dispose();
         mount.registry.dispose();
       }
+      drainingWorkspaceIds.clear();
       if (wss) {
         for (const client of wss.clients) {
           client.close(1012, 'Server shutting down');
@@ -1994,6 +2506,70 @@ export function mountAcpHttp(
       }
     },
     registry,
+    beginWorkspaceDrain: (workspaceId) => {
+      drainingWorkspaceIds.add(workspaceId);
+      const mount = mountForWorkspace(workspaceId);
+      if (!mount) return;
+      mount.draining = true;
+      mount.workspaceRememberLane.beginDrain();
+    },
+    cancelWorkspaceDrain: (workspaceId) => {
+      drainingWorkspaceIds.delete(workspaceId);
+      const mount = mountForWorkspace(workspaceId);
+      if (!mount) return;
+      mount.draining = false;
+      mount.workspaceRememberLane.cancelDrain();
+    },
+    getWorkspaceActivity: (workspaceId) => {
+      const mount = mountForWorkspace(workspaceId);
+      return {
+        acpConnections:
+          (mount?.registry.size ?? 0) + (mount?.pendingWebSockets.size ?? 0),
+        memoryTasks: mount?.workspaceRememberLane.pendingCount() ?? 0,
+      };
+    },
+    ensureWorkspaceRememberLane: (workspaceId) => {
+      // Match every other entry point in this module: after dispose() the
+      // resolver's 503 is the right answer, and creating a mount here would
+      // leak a dispatcher/registry/lane nothing will ever tear down.
+      if (disposed) return undefined;
+      const existing = mountForWorkspace(workspaceId);
+      if (existing) return existing.workspaceRememberLane;
+      const rt = opts.workspaceRegistry?.getByWorkspaceId(workspaceId);
+      if (!rt) return undefined;
+      const mount = getOrCreateSecondaryMount(rt);
+      return mount?.workspaceRememberLane;
+    },
+    getWorkspaceRememberLane: (workspaceId) =>
+      mountForWorkspace(workspaceId)?.workspaceRememberLane,
+    commitWorkspaceRemoval: (workspaceId) => {
+      const mount = secondaryMounts.get(workspaceId);
+      mount?.workspaceRememberLane.dispose();
+    },
+    disposeWorkspace: (workspaceId) => {
+      drainingWorkspaceIds.delete(workspaceId);
+      const mount = mountForWorkspace(workspaceId);
+      if (!mount) return;
+      if (mount.primary) {
+        for (const ws of mount.webSockets) {
+          ws.close(1012, 'Workspace runtime reconfigured');
+        }
+        mount.registry.clear();
+        return;
+      }
+      secondaryMounts.delete(workspaceId);
+      try {
+        mount.workspaceRememberLane.dispose();
+      } finally {
+        try {
+          for (const ws of mount.webSockets) {
+            ws.close(1012, 'Workspace removed');
+          }
+        } finally {
+          mount.registry.dispose();
+        }
+      }
+    },
     getSnapshot: () => {
       const perMount = [
         {
@@ -2011,6 +2587,7 @@ export function mountAcpHttp(
           snap: mount.registry.getSnapshot(),
         });
       }
+      const preAttach = preAttachBudget.snapshot();
       return {
         connectionCount: perMount.reduce(
           (n, m) => n + m.snap.connectionCount,
@@ -2027,11 +2604,22 @@ export function mountAcpHttp(
           (n, m) => n + m.snap.pendingClientRequests,
           0,
         ),
+        bufferedConnectionFrames: perMount.reduce(
+          (n, m) => n + m.snap.bufferedConnectionFrames,
+          0,
+        ),
+        bufferedSessionFrames: perMount.reduce(
+          (n, m) => n + m.snap.bufferedSessionFrames,
+          0,
+        ),
+        pendingDeliveryFrames: preAttach.pendingDeliveryFrames,
+        preAttach,
         mounts: perMount.map((m) => ({
           workspaceId: m.workspaceId,
           primary: m.primary,
           connectionCount: m.snap.connectionCount,
           wsStreams: m.snap.wsStreams,
+          preAttachGuardFailures: m.snap.preAttachGuardFailures,
         })),
         connections: perMount.flatMap((mount) =>
           mount.snap.connections.map((connection) => ({
@@ -2045,6 +2633,25 @@ export function mountAcpHttp(
     },
     attachServer(server: import('node:http').Server) {
       setupWebSocket(server);
+    },
+    detachServer(server: import('node:http').Server) {
+      if (!upgradeServers.delete(server)) return;
+      if (upgradeListener) server.removeListener('upgrade', upgradeListener);
+      // Closing the listener does not close sockets already upgraded off it.
+      // Local Control's disable must actually cut the phone off — leaving a
+      // live ACP socket open would mean the pairing token is revoked but the
+      // session it opened continues, which is the opposite of what the user
+      // asked for. 1001 "going away" is the honest code: the endpoint is
+      // disappearing, and clients treat it as non-retryable.
+      if (!wss) return;
+      for (const client of wss.clients) {
+        const clientSocket = (
+          client as unknown as { _socket?: { server?: unknown } }
+        )._socket;
+        if (clientSocket?.server === server) {
+          client.terminate();
+        }
+      }
     },
   };
 }

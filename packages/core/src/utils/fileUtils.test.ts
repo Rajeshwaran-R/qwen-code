@@ -21,6 +21,8 @@ import { execFile } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import mime from 'mime/lite';
+import type { Part } from '@google/genai';
+import sharp from 'sharp';
 
 import {
   isWithinRoot,
@@ -28,13 +30,13 @@ import {
   detectFileType,
   processSingleFileContent,
   detectBOM,
-  decodeBufferWithEncodingInfo,
   readFileWithLineAndLimit,
   readFileWithEncoding,
   readFileWithEncodingInfo,
   detectFileEncoding,
   fileExists,
 } from './fileUtils.js';
+import { decodeBufferWithEncodingInfo } from '../services/sync-file-encoding.js';
 import { iconvEncode } from './iconvHelper.js';
 import { LargeNonUtf8TextError } from './read-text-range.js';
 import type { Config } from '../config/config.js';
@@ -45,7 +47,7 @@ import {
   renderPDFPagesToImages,
   resetPdftotextCache,
 } from './pdf.js';
-import { VISION_BRIDGE_MAX_IMAGES } from '../services/visionBridge/vision-bridge-constants.js';
+import { VISION_BRIDGE_MAX_IMAGES } from './vision-bridge-constants.js';
 
 vi.mock('mime/lite', () => ({
   default: { getType: vi.fn() },
@@ -865,12 +867,50 @@ describe('fileUtils', () => {
 
     it('should detect image type by extension (png)', async () => {
       mockMimeGetType.mockReturnValueOnce('image/png');
-      expect(await detectFileType('file.png')).toBe('image');
+      const pngPath = path.join(tempRootDir, 'file.png');
+      actualNodeFs.writeFileSync(
+        pngPath,
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+
+      expect(await detectFileType(pngPath)).toBe('image');
+    });
+
+    it('should keep empty image files classified as images', async () => {
+      const emptyImagePath = path.join(tempRootDir, 'empty.png');
+      actualNodeFs.writeFileSync(emptyImagePath, '');
+      mockMimeGetType.mockReturnValueOnce('image/png');
+
+      expect(await detectFileType(emptyImagePath)).toBe('image');
     });
 
     it('should detect image type by extension (jpeg)', async () => {
       mockMimeGetType.mockReturnValueOnce('image/jpeg');
-      expect(await detectFileType('file.jpg')).toBe('image');
+      const jpgPath = path.join(tempRootDir, 'file.jpg');
+      actualNodeFs.writeFileSync(jpgPath, Buffer.from([0xff, 0xd8, 0xff]));
+
+      expect(await detectFileType(jpgPath)).toBe('image');
+    });
+
+    it('should detect a canonical image saved with a different image extension', async () => {
+      mockMimeGetType.mockReturnValueOnce('image/jpeg');
+      const mislabeledPath = path.join(tempRootDir, 'photo.jpg');
+      actualNodeFs.writeFileSync(
+        mislabeledPath,
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
+
+      expect(await detectFileType(mislabeledPath)).toBe('image');
+    });
+
+    it('should preserve image classification when image sniffing cannot open the file', async () => {
+      const imagePath = path.join(tempRootDir, 'unreadable.png');
+      mockMimeGetType.mockReturnValueOnce('image/png');
+      vi.spyOn(fsPromises, 'open').mockRejectedValueOnce(
+        Object.assign(new Error('permission denied'), { code: 'EACCES' }),
+      );
+
+      expect(await detectFileType(imagePath)).toBe('image');
     });
 
     it('should detect svg type by extension', async () => {
@@ -891,6 +931,14 @@ describe('fileUtils', () => {
     it('should detect video type by extension', async () => {
       mockMimeGetType.mockReturnValueOnce('video/mp4');
       expect(await detectFileType('movie.mp4')).toBe('video');
+    });
+
+    it('should detect .m4v as video even though mime/lite omits video/x-m4v', async () => {
+      // mime/lite's standard database has no .m4v entry, so the real lookup
+      // returns null; the override map must still classify it as video rather
+      // than letting it fall through to the binary content sampler.
+      mockMimeGetType.mockReturnValueOnce(null);
+      expect(await detectFileType('tutorial.m4v')).toBe('video');
     });
 
     it('should detect known binary extensions as binary (e.g. .zip)', async () => {
@@ -1156,7 +1204,10 @@ describe('fileUtils', () => {
     });
 
     it('should handle read errors for image/pdf files', async () => {
-      actualNodeFs.writeFileSync(testImageFilePath, 'content'); // File must exist
+      actualNodeFs.writeFileSync(
+        testImageFilePath,
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      );
       mockMimeGetType.mockReturnValue('image/png');
       const readError = new Error('Simulated image read error');
       vi.spyOn(fsPromises, 'readFile').mockRejectedValueOnce(readError);
@@ -1169,33 +1220,476 @@ describe('fileUtils', () => {
       expect(result.returnDisplay).toContain('Simulated image read error');
     });
 
+    it('honors an explicitly provided file type without re-detecting content', async () => {
+      actualNodeFs.writeFileSync(testImageFilePath, 'plain text content');
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(
+        testImageFilePath,
+        mockConfig,
+        { fileType: 'image' },
+      );
+
+      expect(result.llmContent).not.toBe('plain text content');
+      expect(result.error).toBeUndefined();
+    });
+
+    it('omits provider-unsupported image formats instead of forwarding raw bytes (#9291)', async () => {
+      // A MIME type the model endpoint cannot safely consume (image/heic on
+      // Responses-compatible routes) must not be forwarded verbatim: the
+      // provider rejects it with a 400 that aborts the whole session. The
+      // read must stay in-band — a text notice, no inline image, no error.
+      const heicPath = path.join(tempRootDir, 'photo.heic');
+      actualNodeFs.writeFileSync(heicPath, 'not decodable heic bytes');
+      mockMimeGetType.mockReturnValue('image/heic');
+
+      const result = await processSingleFileContent(heicPath, mockConfig);
+
+      expect(result.error).toBeUndefined();
+      expect(typeof result.llmContent).toBe('string');
+      expect(result.llmContent).toContain('image/heic');
+      expect(JSON.stringify(result.llmContent)).not.toContain('inlineData');
+    });
+
+    it('keeps provider-unsupported images inline for the vision bridge', async () => {
+      const heicPath = path.join(tempRootDir, 'photo.heic');
+      const bytes = Buffer.from('heic bytes for bridge');
+      actualNodeFs.writeFileSync(heicPath, bytes);
+      mockMimeGetType.mockReturnValue('image/heic');
+
+      const mockConfigNoImage = {
+        ...mockConfig,
+        getContentGeneratorConfig: () => ({ modalities: {} }),
+      } as unknown as Config;
+
+      const result = await processSingleFileContent(
+        heicPath,
+        mockConfigNoImage,
+        { preserveUnsupportedImage: true },
+      );
+
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: bytes.toString('base64'),
+          mimeType: 'image/heic',
+          displayName: 'photo.heic',
+        },
+      });
+    });
+
+    it('keeps undecodable images inline for the vision bridge', async () => {
+      const corruptPath = path.join(tempRootDir, 'corrupt.png');
+      const bytes = Buffer.from('not a png');
+      actualNodeFs.writeFileSync(corruptPath, bytes);
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const mockConfigNoImage = {
+        ...mockConfig,
+        getContentGeneratorConfig: () => ({ modalities: {} }),
+      } as unknown as Config;
+
+      const result = await processSingleFileContent(
+        corruptPath,
+        mockConfigNoImage,
+        { preserveUnsupportedImage: true },
+      );
+
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: bytes.toString('base64'),
+          mimeType: 'image/png',
+          displayName: 'corrupt.png',
+        },
+      });
+    });
+
     it('should process an image file', async () => {
-      const fakePngData = Buffer.from('fake png data');
-      actualNodeFs.writeFileSync(testImageFilePath, fakePngData);
+      await sharp({
+        create: {
+          width: 20,
+          height: 10,
+          channels: 3,
+          background: '#306090',
+        },
+      })
+        .png()
+        .toFile(testImageFilePath);
       mockMimeGetType.mockReturnValue('image/png');
       const result = await processSingleFileContent(
         testImageFilePath,
         mockConfig,
       );
-      expect(
-        (result.llmContent as { inlineData: unknown }).inlineData,
-      ).toBeDefined();
-      expect(
-        (result.llmContent as { inlineData: { mimeType: string } }).inlineData
-          .mimeType,
-      ).toBe('image/png');
-      expect(
-        (result.llmContent as { inlineData: { data: string } }).inlineData.data,
-      ).toBe(fakePngData.toString('base64'));
-      expect(
-        (result.llmContent as { inlineData: { displayName?: string } })
-          .inlineData.displayName,
-      ).toBe('image.png');
+      const parts = result.llmContent as Part[];
+      expect(parts[0]).toEqual({
+        text:
+          'Image overview: 20x10; oriented source: 20x10. ' +
+          'If details are too small, use tool_search for "zoom image", then ' +
+          'call zoom_image with coordinates normalized from 0 to 1000.',
+      });
+      expect(parts[1]).toEqual({
+        inlineData: {
+          mimeType: 'image/jpeg',
+          data: expect.any(String),
+          displayName: 'image.png',
+        },
+      });
+      const metadata = await sharp(
+        Buffer.from(parts[1]!.inlineData!.data!, 'base64'),
+      ).metadata();
+      expect(metadata).toMatchObject({ width: 20, height: 10 });
       expect(result.returnDisplay).toContain('Read image file: image.png');
     });
 
+    it('returns a bounded overview when a PNG exceeds the old data URI limit', async () => {
+      const largeImagePath = path.join(tempRootDir, 'large.png');
+      await sharp({
+        create: {
+          width: 2200,
+          height: 1800,
+          channels: 3,
+          background: '#306090',
+        },
+      })
+        .png({ compressionLevel: 0 })
+        .toFile(largeImagePath);
+      expect(actualNodeFs.statSync(largeImagePath).size).toBeGreaterThan(
+        9.9 * 1024 * 1024,
+      );
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(largeImagePath, mockConfig);
+
+      expect(result.error).toBeUndefined();
+      const parts = result.llmContent as Part[];
+      const overview = parts[1]!.inlineData!;
+      const metadata = await sharp(
+        Buffer.from(overview.data!, 'base64'),
+      ).metadata();
+      expect(overview.mimeType).toBe('image/jpeg');
+      expect(Buffer.from(overview.data!, 'base64').length).toBeLessThanOrEqual(
+        9 * 1024 * 1024,
+      );
+      expect(Math.max(metadata.width!, metadata.height!)).toBeLessThanOrEqual(
+        1568,
+      );
+      expect(
+        Math.ceil(metadata.width! / 28) * Math.ceil(metadata.height! / 28),
+      ).toBeLessThanOrEqual(1568);
+    });
+
+    it('rejects canonical image sources above 100 MB before decoding', async () => {
+      const oversizedPath = path.join(tempRootDir, 'oversized.png');
+      const handle = await fsPromises.open(oversizedPath, 'w');
+      await handle.truncate(100 * 1024 * 1024 + 1);
+      await handle.close();
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(oversizedPath, mockConfig);
+
+      expect(result.errorType).toBe(ToolErrorType.FILE_TOO_LARGE);
+      expect(result.llmContent).toContain('100 MB source limit');
+    });
+
+    it('reads text-looking corrupt canonical image content as text', async () => {
+      const corruptPath = path.join(tempRootDir, 'corrupt.png');
+      const bytes = Buffer.from('not a real png');
+      await fsPromises.writeFile(corruptPath, bytes);
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(corruptPath, mockConfig);
+
+      expect(result.llmContent).toBe(bytes.toString());
+      expect(result.error).toBeUndefined();
+    });
+
+    it('forwards an animated canonical image verbatim instead of failing the read', async () => {
+      const twoFrameGif = Buffer.from(
+        '47494638396101000100800000000000ffffff21f90400010000002c000000000100010000020244010021f90400010000002c00000000010001000002024c01003b',
+        'hex',
+      );
+      const animatedPath = path.join(tempRootDir, 'animated.webp');
+      await sharp(twoFrameGif, { animated: true }).webp().toFile(animatedPath);
+      mockMimeGetType.mockReturnValue('image/webp');
+
+      const result = await processSingleFileContent(animatedPath, mockConfig);
+
+      const onDisk = await fsPromises.readFile(animatedPath);
+      expect(result.error).toBeUndefined();
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: onDisk.toString('base64'),
+          mimeType: 'image/webp',
+          displayName: 'animated.webp',
+        },
+      });
+      expect(result.returnDisplay).toContain('Read image file: animated.webp');
+    });
+
+    it('omits non-canonical content behind a canonical extension (#9291)', async () => {
+      const gifBytes = Buffer.from(
+        '47494638396101000100800000000000ffffff21f90400010000002c000000000100010000020244010021f90400010000002c00000000010001000002024c01003b',
+        'hex',
+      );
+      const mismatchPath = path.join(tempRootDir, 'mismatch.png');
+      await fsPromises.writeFile(mismatchPath, gifBytes);
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(mismatchPath, mockConfig);
+
+      expect(result.llmContent).toContain(
+        'Cannot display content of binary file',
+      );
+      expect(result.returnDisplay).toContain(
+        'Skipped binary file: mismatch.png',
+      );
+      expect(result.error).toBeUndefined();
+    });
+
+    it('rejects ZIP containers behind an image extension', async () => {
+      const zipPath = path.join(tempRootDir, 'archive.png');
+      await fsPromises.writeFile(
+        zipPath,
+        Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+      );
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(zipPath, mockConfig);
+
+      expect(result.llmContent).toContain(
+        'Cannot display content of binary file',
+      );
+      expect(result.returnDisplay).toContain(
+        'Skipped binary file: archive.png',
+      );
+      expect(result.error).toBeUndefined();
+      expect(typeof result.llmContent).toBe('string');
+      expect(JSON.stringify(result.llmContent)).not.toContain('inlineData');
+    });
+
+    it('rejects unrecognized binary content behind an image extension', async () => {
+      const binaryPath = path.join(tempRootDir, 'garbage.png');
+      await fsPromises.writeFile(
+        binaryPath,
+        Buffer.from([0x00, 0x01, 0x02, 0x03]),
+      );
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(binaryPath, mockConfig);
+
+      expect(result.llmContent).toContain(
+        'Cannot display content of binary file',
+      );
+      expect(result.returnDisplay).toContain(
+        'Skipped binary file: garbage.png',
+      );
+      expect(result.error).toBeUndefined();
+    });
+
+    it('rejects two-byte content behind an image extension as binary', async () => {
+      const tinyPath = path.join(tempRootDir, 'tiny.png');
+      await fsPromises.writeFile(tinyPath, Buffer.from('hi'));
+      mockMimeGetType.mockReturnValue('image/png');
+
+      const result = await processSingleFileContent(tinyPath, mockConfig);
+
+      expect(result.llmContent).toContain(
+        'Cannot display content of binary file',
+      );
+      expect(result.returnDisplay).toContain('Skipped binary file: tiny.png');
+      expect(result.error).toBeUndefined();
+    });
+
+    it.each([
+      { extension: 'png', mimeType: 'image/png' },
+      { extension: 'jpg', mimeType: 'image/jpeg' },
+      { extension: 'gif', mimeType: 'image/gif' },
+      { extension: 'webp', mimeType: 'image/webp' },
+    ])(
+      'reads text content behind a .$extension extension as text',
+      async ({ extension, mimeType }) => {
+        const jsonBytes = Buffer.from(
+          '{"meta":{"format":"png"},"data":"not-a-real-image"}',
+        );
+        const screenshotPath = path.join(
+          tempRootDir,
+          `screenshot.${extension}`,
+        );
+        await fsPromises.writeFile(screenshotPath, jsonBytes);
+        mockMimeGetType.mockReturnValue(mimeType);
+
+        const result = await processSingleFileContent(
+          screenshotPath,
+          mockConfig,
+        );
+
+        expect(result.llmContent).toBe(jsonBytes.toString());
+        expect(result.returnDisplay).toBe('');
+        expect(result.error).toBeUndefined();
+      },
+    );
+
+    it.each([
+      { extension: 'png', mimeType: 'image/png' },
+      { extension: 'jpg', mimeType: 'image/jpeg' },
+      { extension: 'gif', mimeType: 'image/gif' },
+      { extension: 'webp', mimeType: 'image/webp' },
+    ])(
+      'reads BOM-prefixed UTF-16 text behind a .$extension extension as text',
+      async ({ extension, mimeType }) => {
+        const text = 'text saved with the wrong extension';
+        const imagePath = path.join(tempRootDir, `notes.${extension}`);
+        await fsPromises.writeFile(
+          imagePath,
+          Buffer.concat([
+            Buffer.from([0xff, 0xfe]),
+            Buffer.from(text, 'utf16le'),
+          ]),
+        );
+        mockMimeGetType.mockReturnValue(mimeType);
+
+        const result = await processSingleFileContent(imagePath, mockConfig);
+
+        expect(result.llmContent).toBe(text);
+        expect(result.returnDisplay).toBe('');
+        expect(result.error).toBeUndefined();
+      },
+    );
+
+    it('applies EXIF orientation before describing and rendering an overview', async () => {
+      const orientedPath = path.join(tempRootDir, 'oriented.jpg');
+      await sharp({
+        create: {
+          width: 60,
+          height: 40,
+          channels: 3,
+          background: '#306090',
+        },
+      })
+        .jpeg()
+        .withMetadata({ orientation: 6 })
+        .toFile(orientedPath);
+      mockMimeGetType.mockReturnValue('image/jpeg');
+
+      const result = await processSingleFileContent(orientedPath, mockConfig);
+      const parts = result.llmContent as Part[];
+      const metadata = await sharp(
+        Buffer.from(parts[1]!.inlineData!.data!, 'base64'),
+      ).metadata();
+
+      expect(parts[0]?.text).toContain('oriented source: 40x60');
+      expect(metadata).toMatchObject({ width: 40, height: 60 });
+    });
+
+    it('flattens transparent overview pixels onto white', async () => {
+      const transparentPath = path.join(tempRootDir, 'transparent.webp');
+      await sharp({
+        create: {
+          width: 20,
+          height: 20,
+          channels: 4,
+          background: { r: 0, g: 0, b: 0, alpha: 0 },
+        },
+      })
+        .webp()
+        .toFile(transparentPath);
+      mockMimeGetType.mockReturnValue('image/webp');
+
+      const result = await processSingleFileContent(
+        transparentPath,
+        mockConfig,
+      );
+      const parts = result.llmContent as Part[];
+      const { data, info } = await sharp(
+        Buffer.from(parts[1]!.inlineData!.data!, 'base64'),
+      )
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      const center =
+        (Math.floor(info.height / 2) * info.width +
+          Math.floor(info.width / 2)) *
+        info.channels;
+
+      expect(Array.from(data.subarray(center, center + 3))).toEqual([
+        255, 255, 255,
+      ]);
+    });
+
+    it('keeps animated GIF image bytes unchanged', async () => {
+      // A real, decodable GIF: forwarded verbatim (never re-encoded).
+      const gifBytes = Buffer.from(
+        '47494638396101000100800000000000ffffff21f90400010000002c000000000100010000020244010021f90400010000002c00000000010001000002024c01003b',
+        'hex',
+      );
+      const filePath = path.join(tempRootDir, 'animation.gif');
+      actualNodeFs.writeFileSync(filePath, gifBytes);
+      mockMimeGetType.mockReturnValue('image/gif');
+
+      const result = await processSingleFileContent(filePath, mockConfig);
+
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: gifBytes.toString('base64'),
+          mimeType: 'image/gif',
+          displayName: 'animation.gif',
+        },
+      });
+    });
+
+    it('omits a corrupt GIF instead of forwarding undecodable bytes (#9291)', async () => {
+      const filePath = path.join(tempRootDir, 'broken.gif');
+      actualNodeFs.writeFileSync(filePath, Buffer.from('not a real gif'));
+      mockMimeGetType.mockReturnValue('image/gif');
+
+      const result = await processSingleFileContent(filePath, mockConfig);
+
+      expect(result.error).toBeUndefined();
+      expect(typeof result.llmContent).toBe('string');
+      expect(JSON.stringify(result.llmContent)).not.toContain('inlineData');
+    });
+
+    it('keeps corrupt GIF bytes inline for the vision bridge', async () => {
+      const filePath = path.join(tempRootDir, 'broken.gif');
+      const bytes = Buffer.from('not a real gif');
+      actualNodeFs.writeFileSync(filePath, bytes);
+      mockMimeGetType.mockReturnValue('image/gif');
+
+      const mockConfigNoImage = {
+        ...mockConfig,
+        getContentGeneratorConfig: () => ({ modalities: {} }),
+      } as unknown as Config;
+
+      const result = await processSingleFileContent(
+        filePath,
+        mockConfigNoImage,
+        { preserveUnsupportedImage: true },
+      );
+
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: bytes.toString('base64'),
+          mimeType: 'image/gif',
+          displayName: 'broken.gif',
+        },
+      });
+    });
+
+    it('omits BMP image bytes the provider cannot safely consume (#9291)', async () => {
+      const filePath = path.join(tempRootDir, 'bitmap.bmp');
+      const bytes = Buffer.from('unchanged image bytes');
+      actualNodeFs.writeFileSync(filePath, bytes);
+      mockMimeGetType.mockReturnValue('image/bmp');
+
+      const result = await processSingleFileContent(filePath, mockConfig);
+
+      expect(result.error).toBeUndefined();
+      expect(typeof result.llmContent).toBe('string');
+      expect(result.llmContent).toContain('image/bmp');
+    });
+
     it('should reject image files when model does not support image', async () => {
-      const fakePngData = Buffer.from('fake png data');
+      const fakePngData = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
       actualNodeFs.writeFileSync(testImageFilePath, fakePngData);
       mockMimeGetType.mockReturnValue('image/png');
 
@@ -1215,8 +1709,16 @@ describe('fileUtils', () => {
     });
 
     it('keeps image inline when preserveUnsupportedImage is true', async () => {
-      const fakePngData = Buffer.from('fake png data');
-      actualNodeFs.writeFileSync(testImageFilePath, fakePngData);
+      await sharp({
+        create: {
+          width: 8,
+          height: 8,
+          channels: 3,
+          background: '#306090',
+        },
+      })
+        .png()
+        .toFile(testImageFilePath);
       mockMimeGetType.mockReturnValue('image/png');
 
       const mockConfigNoImage = {
@@ -1230,15 +1732,20 @@ describe('fileUtils', () => {
         { preserveUnsupportedImage: true },
       );
       expect(typeof result.llmContent).toBe('object');
-      expect(
-        (result.llmContent as { inlineData: { mimeType: string } }).inlineData
-          .mimeType,
-      ).toBe('image/png');
+      const parts = result.llmContent as Part[];
+      expect(parts[0]?.text).toContain('Image overview');
+      expect(parts[1]?.inlineData).toMatchObject({
+        mimeType: 'image/jpeg',
+        data: expect.any(String),
+        displayName: 'image.png',
+      });
       expect(result.returnDisplay).toContain('Read image file');
     });
 
     it('still strips image for agent reads without the preserve flag', async () => {
-      const fakePngData = Buffer.from('fake png data');
+      const fakePngData = Buffer.from([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ]);
       actualNodeFs.writeFileSync(testImageFilePath, fakePngData);
       mockMimeGetType.mockReturnValue('image/png');
 
@@ -1274,6 +1781,53 @@ describe('fileUtils', () => {
       );
       expect(typeof result.llmContent).toBe('string');
       expect(result.llmContent).toContain('does not support audio input');
+    });
+
+    it('keeps supported audio bytes unchanged', async () => {
+      const audioPath = path.join(tempRootDir, 'clip.mp3');
+      const audioBytes = Buffer.from('fake audio data');
+      actualNodeFs.writeFileSync(audioPath, audioBytes);
+      mockMimeGetType.mockReturnValue('audio/mpeg');
+      const audioConfig = {
+        ...mockConfig,
+        getContentGeneratorConfig: () => ({
+          modalities: { image: true, audio: true, video: true },
+        }),
+      } as unknown as Config;
+
+      const result = await processSingleFileContent(audioPath, audioConfig);
+
+      expect(result.llmContent).toEqual({
+        inlineData: {
+          data: audioBytes.toString('base64'),
+          mimeType: 'audio/mpeg',
+          displayName: 'clip.mp3',
+        },
+      });
+    });
+
+    it('processes an .m4v video as inline data despite the mime/lite gap', async () => {
+      // Regression guard for the /learn local-video path: mime/lite returns
+      // null for .m4v, so without the detectFileType override the file fell
+      // through to the content sampler and was misclassified as binary,
+      // yielding a "Cannot display content of binary file" string instead of
+      // an inlineData Part.
+      const fakeVideo = Buffer.from('fake m4v data');
+      const testVideoPath = path.join(tempRootDir, 'tutorial.m4v');
+      actualNodeFs.writeFileSync(testVideoPath, fakeVideo);
+      mockMimeGetType.mockReturnValue(null);
+
+      const result = await processSingleFileContent(testVideoPath, mockConfig);
+
+      expect(typeof result.llmContent).toBe('object');
+      expect(
+        (result.llmContent as { inlineData: { data: string } }).inlineData.data,
+      ).toBe(fakeVideo.toString('base64'));
+      expect(
+        (result.llmContent as { inlineData: { mimeType: string } }).inlineData
+          .mimeType,
+      ).toBe('video/x-m4v');
+      expect(result.returnDisplay).toContain('Read video file');
     });
 
     it('should fall back to pdftotext when model does not support PDF', async () => {
@@ -2065,6 +2619,32 @@ describe('fileUtils', () => {
         expect(result.errorType).toBe(ToolErrorType.FILE_TOO_LARGE);
         expect(result.llmContent).toContain('too large to return safely');
       });
+
+      it('falls back to text guidance when rendering returns no page images', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: 'x'.repeat(80_000), stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          visionConfig,
+          { pages: '1' },
+        );
+
+        expect(result.errorType).toBe(ToolErrorType.FILE_TOO_LARGE);
+        expect(result.llmContent).toContain('too large to return safely');
+        expect(Array.isArray(result.llmContent)).toBe(false);
+        expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
+          firstPage: 1,
+          lastPage: 1,
+        });
+      });
     });
 
     describe('PDF vision-bridge rendering (text-only model)', () => {
@@ -2097,10 +2677,11 @@ describe('fileUtils', () => {
         expect(Array.isArray(result.llmContent)).toBe(true);
         expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
           firstPage: 1,
-          lastPage: VISION_BRIDGE_MAX_IMAGES,
+          lastPage: 2,
         });
         const parts = result.llmContent as MediaPart[];
         expect(parts.filter((p) => p.inlineData).length).toBe(2);
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
       });
 
       it('notes how many pages were rendered when more remain', async () => {
@@ -2130,7 +2711,11 @@ describe('fileUtils', () => {
         const parts = result.llmContent as MediaPart[];
         expect(parts.filter((p) => p.inlineData).length).toBe(4);
         expect(
-          parts.some((p) => typeof p.text === 'string' && /of 10/.test(p.text)),
+          parts.some(
+            (p) =>
+              typeof p.text === 'string' &&
+              /pages 5-10 were not included/.test(p.text),
+          ),
         ).toBe(true);
       });
 
@@ -2162,10 +2747,334 @@ describe('fileUtils', () => {
         );
         // No exact count is known, so no "of N", but truncation is still noted.
         const note = parts.find(
-          (p) => typeof p.text === 'string' && /not included/.test(p.text),
+          (p) =>
+            typeof p.text === 'string' && /later pages may remain/.test(p.text),
         );
         expect(note).toBeDefined();
-        expect(note!.text).not.toMatch(/ of \d/);
+        expect(note!.text).not.toMatch(/pages \d+-\d+ were not included/);
+      });
+
+      it('renders from the requested start page and records the remaining range', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          25\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [
+            fakeImage('20'),
+            fakeImage('21'),
+            fakeImage('22'),
+            fakeImage('23'),
+          ],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
+          firstPage: 20,
+          lastPage: 23,
+        });
+        const parts = result.llmContent as Part[];
+        expect(
+          parts
+            .filter((part) => part.inlineData)
+            .map((part) => part.inlineData?.displayName),
+        ).toEqual([
+          'document.pdf (page 20)',
+          'document.pdf (page 21)',
+          'document.pdf (page 22)',
+          'document.pdf (page 23)',
+        ]);
+        expect(result.pdfVisionBridgeCandidate).toMatchObject({
+          reason: 'text_extraction_failed',
+          renderedRange: { firstPage: 20, lastPage: 23 },
+          continuation: {
+            certainty: 'known',
+            firstPage: 24,
+            lastPage: 25,
+          },
+        });
+      });
+
+      it('clips an explicit range to the actual PDF and does not invent remaining pages', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          6\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [fakeImage('4'), fakeImage('5'), fakeImage('6')],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '4-8', preparePdfForVisionBridge: true },
+        );
+
+        expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
+          firstPage: 4,
+          lastPage: 6,
+        });
+        expect(result.pdfVisionBridgeCandidate).toMatchObject({
+          renderedRange: { firstPage: 4, lastPage: 6 },
+        });
+        expect(result.pdfVisionBridgeCandidate?.continuation).toBeUndefined();
+        expect(JSON.stringify(result.llmContent)).not.toContain('pages 7-8');
+      });
+
+      it('treats a short render as EOF when the PDF page count is unavailable', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: '', stderr: 'pdfinfo missing', code: 1 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [fakeImage('4'), fakeImage('5'), fakeImage('6')],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '4-8', preparePdfForVisionBridge: true },
+        );
+
+        expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
+          firstPage: 4,
+          lastPage: 7,
+        });
+        expect(result.pdfVisionBridgeCandidate?.continuation).toBeUndefined();
+        expect(JSON.stringify(result.llmContent)).not.toContain('pages 7-8');
+      });
+
+      it('marks continuation as possible when an unknown PDF fills the render cap', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: '', stderr: 'pdfinfo missing', code: 1 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [
+            fakeImage('20'),
+            fakeImage('21'),
+            fakeImage('22'),
+            fakeImage('23'),
+          ],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.pdfVisionBridgeCandidate?.continuation).toEqual({
+          certainty: 'possible',
+          firstPage: 24,
+          requestedLastPage: 25,
+        });
+        expect(JSON.stringify(result.llmContent)).toContain(
+          'additional requested pages may exist from page 24 through page 25',
+        );
+      });
+
+      it('does not render when an explicit range starts past the PDF end', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          6\n', stderr: '', code: 0 });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(mockRender).not.toHaveBeenCalled();
+        expect(result.errorType).toBe(ToolErrorType.READ_CONTENT_FAILURE);
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
+      });
+
+      it('prepares a candidate when an explicit single page still overflows', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: 'x'.repeat(80_000), stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          25\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [fakeImage('20')],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20', preparePdfForVisionBridge: true },
+        );
+
+        expect(mockRender).toHaveBeenCalledWith(testPdfFilePath, {
+          firstPage: 20,
+          lastPage: 20,
+        });
+        expect(result.pdfVisionBridgeCandidate).toMatchObject({
+          reason: 'single_page_text_overflow',
+          renderedRange: { firstPage: 20, lastPage: 20 },
+          fallback: { errorType: ToolErrorType.FILE_TOO_LARGE },
+        });
+      });
+
+      it('renders an actual one-page @ PDF when its text overflows', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: 'Pages:          1\n', stderr: '', code: 0 });
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: 'x'.repeat(80_000), stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [fakeImage('1')],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { preserveUnsupportedImage: true, largePdfBehavior: 'reference' },
+        );
+
+        expect(result.error).toBeUndefined();
+        expect(
+          (result.llmContent as MediaPart[]).filter((part) => part.inlineData),
+        ).toHaveLength(1);
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
+      });
+
+      it('records unrendered requested pages when the byte budget truncates images', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          25\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [fakeImage('20'), fakeImage('21')],
+          bytesTruncated: true,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.pdfVisionBridgeCandidate).toMatchObject({
+          renderedRange: { firstPage: 20, lastPage: 21 },
+          continuation: {
+            certainty: 'known',
+            firstPage: 22,
+            lastPage: 25,
+          },
+        });
+        expect(JSON.stringify(result.llmContent)).toContain(
+          'pages 22-25 were not included',
+        );
+      });
+
+      it('does not render when a multi-page text result overflows', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: 'x'.repeat(80_000), stderr: '', code: 0 });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.errorType).toBe(ToolErrorType.FILE_TOO_LARGE);
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
+        expect(mockRender).not.toHaveBeenCalled();
+      });
+
+      it('does not bridge explicit page overflow for a native PDF model', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: 'x'.repeat(80_000), stderr: '', code: 0 });
+        const nativePdfConfig = {
+          ...bridgeConfig,
+          getContentGeneratorConfig: () => ({ modalities: { pdf: true } }),
+        } as unknown as Config;
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          nativePdfConfig,
+          { pages: '20', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.errorType).toBe(ToolErrorType.FILE_TOO_LARGE);
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
+        expect(mockRender).not.toHaveBeenCalled();
+      });
+
+      it('restores the extraction failure when bridge rendering fails', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          25\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: false,
+          error: 'renderer unavailable',
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.errorType).toBe(ToolErrorType.READ_CONTENT_FAILURE);
+        expect(result.llmContent).toContain('Cannot extract text from PDF');
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
+      });
+
+      it('restores the extraction failure when rendering returns no page images', async () => {
+        actualNodeFs.writeFileSync(testPdfFilePath, Buffer.from('%PDF-1.7'));
+        mockMimeGetType.mockReturnValue('application/pdf');
+        mockExecResult({ stdout: '', stderr: 'pdftotext version', code: 0 });
+        mockExecResult({ stdout: '   ', stderr: '', code: 0 });
+        mockExecResult({ stdout: 'Pages:          25\n', stderr: '', code: 0 });
+        mockRender.mockResolvedValue({
+          success: true,
+          images: [],
+          bytesTruncated: false,
+        });
+
+        const result = await processSingleFileContent(
+          testPdfFilePath,
+          bridgeConfig,
+          { pages: '20-25', preparePdfForVisionBridge: true },
+        );
+
+        expect(result.errorType).toBe(ToolErrorType.READ_CONTENT_FAILURE);
+        expect(result.llmContent).toContain('Cannot extract text from PDF');
+        expect(result.pdfVisionBridgeCandidate).toBeUndefined();
       });
 
       it('keeps text-heavy @ PDFs as reference (text-first, no render)', async () => {
@@ -2202,6 +3111,23 @@ describe('fileUtils', () => {
         expect(result.errorType).toBe(ToolErrorType.READ_CONTENT_FAILURE);
         expect(result.llmContent).toContain('Cannot extract text from PDF');
         expect(mockRender).not.toHaveBeenCalled();
+      });
+
+      it('does not preserve ordinary images with the PDF-only bridge flag', async () => {
+        actualNodeFs.writeFileSync(
+          testImageFilePath,
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        );
+        mockMimeGetType.mockReturnValue('image/png');
+
+        const result = await processSingleFileContent(
+          testImageFilePath,
+          bridgeConfig,
+          { preparePdfForVisionBridge: true },
+        );
+
+        expect(result.llmContent).toContain('Unsupported image file');
+        expect(Array.isArray(result.llmContent)).toBe(false);
       });
     });
 
@@ -2438,6 +3364,27 @@ describe('fileUtils', () => {
           signal: controller.signal,
         }),
       ).rejects.toThrow(/abort/i);
+    });
+
+    it('reports lineEnding and truncatedByBytes on an unbounded read', async () => {
+      actualNodeFs.writeFileSync(
+        testTextFilePath,
+        'alpha\r\nbravo\r\ncharlie\r\n',
+      );
+
+      const whole = await readFileWithLineAndLimit({
+        path: testTextFilePath,
+        limit: Number.POSITIVE_INFINITY,
+      });
+      const range = await readFileWithLineAndLimit({
+        path: testTextFilePath,
+        limit: 3,
+      });
+
+      expect(whole.lineEnding).toBe('crlf');
+      expect(whole.truncatedByBytes).toBe(false);
+      expect(whole.lineEnding).toBe(range.lineEnding);
+      expect(whole.truncatedByBytes).toBe(range.truncatedByBytes);
     });
 
     it('should use provided stats when reading with line and byte limits', async () => {
@@ -2686,16 +3633,11 @@ describe('fileUtils', () => {
     });
 
     it('should still return an error if an inline media file exceeds 10MB', async () => {
-      mockMimeGetType.mockReturnValue('image/png');
-      actualNodeFs.writeFileSync(
-        testImageFilePath,
-        Buffer.alloc(11 * 1024 * 1024),
-      );
+      const largeGifPath = path.join(tempRootDir, 'large.gif');
+      mockMimeGetType.mockReturnValue('image/gif');
+      actualNodeFs.writeFileSync(largeGifPath, Buffer.alloc(11 * 1024 * 1024));
 
-      const result = await processSingleFileContent(
-        testImageFilePath,
-        mockConfig,
-      );
+      const result = await processSingleFileContent(largeGifPath, mockConfig);
 
       expect(result.error).toContain('File size exceeds the 10MB limit');
       expect(result.returnDisplay).toContain(

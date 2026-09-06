@@ -1,23 +1,33 @@
 import { useState, useEffect, useRef } from 'react';
 import { dp } from './dialogStyles';
-import { useConnection, useSessions } from '@qwen-code/webui/daemon-react-sdk';
+import { useConnection } from '@qwen-code/web-shell/daemon-react-sdk';
 import { useI18n } from '../../i18n';
 import { useListboxKeyboard } from '../../hooks/useListboxKeyboard';
 import { useFilterInput } from '../../hooks/useFilterInput';
 import { SessionRow } from './SessionRow';
+import { sessionMatchesGitQuery } from '../sidebar/sessionSearch';
+import { useScopedSessions } from '../../hooks/useScopedSessions';
 
 interface ResumeDialogProps {
   onSelect: (sessionId: string) => void;
   onClose: () => void;
+  workspaceCwd?: string;
 }
 
 const LIST_ID = 'resume-session-list';
 const optionId = (index: number) => `${LIST_ID}-opt-${index}`;
 
-export function ResumeDialog({ onSelect, onClose }: ResumeDialogProps) {
+export function ResumeDialog({
+  onSelect,
+  onClose,
+  workspaceCwd,
+}: ResumeDialogProps) {
   const { t } = useI18n();
   const connection = useConnection();
-  const { sessions, loading, error } = useSessions({ autoLoad: true });
+  const { sessions, loading, error } = useScopedSessions(workspaceCwd, {
+    autoLoad: true,
+    maxAgeMs: 1_000,
+  });
   const currentSessionId = connection.sessionId;
   // -1 = no highlight. The dialog opens with nothing highlighted and resets to
   // none on filter edits, so Enter in the search box cannot confirm a row the
@@ -34,7 +44,8 @@ export function ResumeDialog({ onSelect, onClose }: ResumeDialogProps) {
         const q = filterQuery.toLowerCase();
         return (
           (s.displayName || '').toLowerCase().includes(q) ||
-          s.sessionId.toLowerCase().includes(q)
+          s.sessionId.toLowerCase().includes(q) ||
+          sessionMatchesGitQuery(s, q)
         );
       })
     : sessions;

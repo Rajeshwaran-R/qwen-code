@@ -21,13 +21,14 @@ Grouped by domain.
 
 ### Core session
 
-| Type                       | Direction      | Trigger                                                                       | Key payload fields                                                               |
-| -------------------------- | -------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `session_update`           | S->C           | Any ACP `sessionUpdate` notification: agent text, thought, tool call, or plan | `sessionUpdate: string, content?: ...` (opaque ACP shape)                        |
-| `session_metadata_updated` | S->C           | `PATCH /session/:id/metadata`                                                 | `sessionId, displayName?`                                                        |
-| `session_died`             | S->C terminal  | `channel.exited`                                                              | `sessionId, reason, exitCode? \| null, signalCode? \| null`                      |
-| `session_closed`           | S->C terminal  | `DELETE /session/:id` or programmatic close                                   | `sessionId, reason: 'client_close' \| string, closedBy?`                         |
-| `session_snapshot`         | S->C synthetic | Snapshot frame after SSE attach / replay                                      | `sessionId, currentModelId: string \| null, currentApprovalMode: string \| null` |
+| Type                         | Direction      | Trigger                                                                               | Key payload fields                                                                                           |
+| ---------------------------- | -------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `session_update`             | S->C           | Any ACP `sessionUpdate` notification: agent text, thought, tool call, or plan         | `sessionUpdate: string, content?: ...` (opaque ACP shape)                                                    |
+| `session_metadata_updated`   | S->C           | `PATCH /session/:id/metadata`                                                         | `sessionId, displayName?`                                                                                    |
+| `session_died`               | S->C terminal  | `channel.exited`                                                                      | `sessionId, reason, exitCode? \| null, signalCode? \| null`                                                  |
+| `session_closed`             | S->C terminal  | `DELETE /session/:id` or programmatic close                                           | `sessionId, reason: 'client_close' \| string, closedBy?`                                                     |
+| `session_snapshot`           | S->C synthetic | Snapshot frame after SSE attach / replay                                              | `sessionId, currentModelId: string \| null, currentApprovalMode: string \| null, recordingDegraded: boolean` |
+| `session_recording_degraded` | S->C           | The session transcript writer permanently stopped after an asynchronous write failure | `sessionId, reason: 'write_failed'`                                                                          |
 
 ### Subscriber-level synthetic frames
 
@@ -76,11 +77,13 @@ Grouped by domain.
 | `agent_changed`          | S->C      | `change: 'created' \| 'updated' \| 'deleted', name, level: 'project' \| 'user'`                                                                |
 | `approval_mode_changed`  | S->C      | `sessionId, previous, next, persisted: boolean`                                                                                                |
 | `tool_toggled`           | S->C      | `toolName, enabled`; affects the next ACP child spawn and does not mutate already-running sessions.                                            |
-| `settings_changed`       | S->C      | Workspace settings write completed. Payload is open; consumers should refresh with read-after-write.                                           |
+| `settings_changed`       | S->C      | Workspace settings write completed. Payload includes `key`; `value`, `scope`, and Skill-toggle `mutation` are optional.                        |
 | `settings_reloaded`      | S->C      | Daemon workspace service reread settings. Payload is open.                                                                                     |
 | `trust_change_requested` | S->C      | `workspaceCwd, desiredState: 'trusted' \| 'untrusted', reason?`                                                                                |
 | `workspace_initialized`  | S->C      | `path, action: 'created' \| 'overwrote' \| 'noop', originatorClientId?`                                                                        |
 | `github_setup_completed` | S->C      | `releaseTag, readmeUrl, secretsUrl?, workflows: [{path, status, sizeBytes?, error?}], gitignore: {path, status, added?, error?}`               |
+
+Skill toggle APIs attach optional `mutation: { id, kind: 'skill_toggle', skills: [{ name, enabled }], activation, sessionsRefreshed, sessionsFailed }`. Every `skills.disabled` / `skills.enabled` event from the same request shares one mutation id. Other settings writes omit `mutation`. Workspace-service writes include `scope`; some other emitters (for example session model switches) omit it. The SDK normalizer defaults missing `scope` to `'workspace'`.
 
 `memory_changed` also covers sessionless managed-memory tasks. For those
 payloads, `scope` is `"managed"`, `source` is one of
@@ -123,23 +126,23 @@ These events are workspace-keyed, not session-keyed. The session reducer treats 
 
 ### Turn lifecycle / assistant pushes
 
-| Type                  | Direction | Trigger                                                                                                             | Key payload fields                                                                                                                                                                               |
-| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `prompt_cancelled`    | S->C      | Prompt was cancelled through explicit `cancelSession` route **or** originator SSE disconnect                        | Envelope stamps `originatorClientId` for the canceling client. This means "cancellation requested", not "cancellation confirmed". Peer subscribers learn that the prompt has ended.              |
-| `turn_complete`       | S->C      | A turn completed successfully                                                                                       | `sessionId, stopReason, promptId?`. `promptId` links to non-blocking prompt responses (`202`). The SDK matches SSE events to the originating prompt through it.                                  |
-| `turn_error`          | S->C      | A turn failed                                                                                                       | `sessionId, message, code?, promptId?`; same `promptId` correlation mechanism.                                                                                                                   |
-| `session_rewound`     | S->C      | `POST /session/:id/rewind` succeeded                                                                                | `sessionId, promptId, targetTurnIndex, filesChanged[], filesFailed[], originatorClientId?`                                                                                                       |
-| `session_branched`    | S->C      | `POST /session/:id/branch` created a branch from an existing session                                                | `sourceSessionId, newSessionId, displayName, originatorClientId?`                                                                                                                                |
-| `followup_suggestion` | S->C      | ACP child generated ghost-text follow-up suggestions after `end_turn`, forwarded over per-session SSE               | `sessionId, suggestion, promptId`; wire only carries suggestions whose `getFilterReason()===null`. Clients render them as input-placeholder ghost text and invalidate them on next `sendPrompt`. |
-| `user_shell_command`  | S->C      | User started a shell command through `POST /session/:id/shell`; fanned out to other subscribers in the same session | `sessionId, command, shellId, originatorClientId?`. There is no typed `DaemonXxxData` interface yet; `asKnownDaemonEvent` returns `undefined` and the UI normalizer parses it ad hoc.            |
-| `user_shell_result`   | S->C      | Result of the shell command above                                                                                   | `sessionId, shellId, exitCode, output, aborted`. Same ad hoc parsing note as `user_shell_command`.                                                                                               |
+| Type                  | Direction | Trigger                                                                                                             | Key payload fields                                                                                                                                                                                                                                                                      |
+| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prompt_cancelled`    | S->C      | Prompt was cancelled through explicit `cancelSession` route **or** originator SSE disconnect                        | Envelope stamps `originatorClientId` for the canceling client. This means "cancellation requested", not "cancellation confirmed". Peer subscribers learn that the prompt has ended.                                                                                                     |
+| `turn_complete`       | S->C      | A turn completed successfully                                                                                       | `sessionId, stopReason, promptId?, branchPoint?`. `promptId` links to non-blocking prompt responses (`202`). Eligible completed turns include `branchPoint: { assistantRecordUuid, checkpointUuid }`.                                                                                   |
+| `turn_error`          | S->C      | A turn failed                                                                                                       | `sessionId, message, code?, promptId?`; same `promptId` correlation mechanism. For agent-side `-32603` failures `message` carries the provider's own detail when the agent supplied one (`data.details` / `data.message` / nested `data.error.message`), not the generic JSON-RPC text. |
+| `session_rewound`     | S->C      | `POST /session/:id/rewind` succeeded                                                                                | `sessionId, promptId, targetTurnIndex, filesChanged[], filesFailed[], originatorClientId?`                                                                                                                                                                                              |
+| `session_branched`    | S->C      | Legacy compatibility event; the current branch endpoint returns its result directly and does not publish this event | `sourceSessionId, newSessionId, displayName, originatorClientId?`. Readers retain support for older producers.                                                                                                                                                                          |
+| `followup_suggestion` | S->C      | ACP child generated ghost-text follow-up suggestions after `end_turn`, forwarded over per-session SSE               | `sessionId, suggestion, promptId`; wire only carries suggestions whose `getFilterReason()===null`. Clients render them as input-placeholder ghost text and invalidate them on next `sendPrompt`.                                                                                        |
+| `user_shell_command`  | S->C      | User started a shell command through `POST /session/:id/shell`; fanned out to other subscribers in the same session | `sessionId, command, shellId, originatorClientId?`. There is no typed `DaemonXxxData` interface yet; `asKnownDaemonEvent` returns `undefined` and the UI normalizer parses it ad hoc.                                                                                                   |
+| `user_shell_result`   | S->C      | Result of the shell command above                                                                                   | `sessionId, shellId, exitCode, output, aborted`. Same ad hoc parsing note as `user_shell_command`.                                                                                                                                                                                      |
 
 ## Architecture
 
 | Concern                                | Source                                         | Notes                                                                                                              |
 | -------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `EVENT_SCHEMA_VERSION = 1`             | `packages/acp-bridge/src/eventBus.ts`          | Sent on every frame.                                                                                               |
-| `DAEMON_KNOWN_EVENT_TYPE_VALUES`       | `packages/sdk-typescript/src/daemon/events.ts` | Closed list with 47 types.                                                                                         |
+| `DAEMON_KNOWN_EVENT_TYPE_VALUES`       | `packages/sdk-typescript/src/daemon/events.ts` | Closed list with 53 types.                                                                                         |
 | `DaemonEventEnvelope<TType, TData>`    | `events.ts`                                    | Generic envelope.                                                                                                  |
 | `DaemonKnownEventType`                 | `events.ts`                                    | `typeof DAEMON_KNOWN_EVENT_TYPE_VALUES[number]`.                                                                   |
 | Per-event payload types                | `events.ts`                                    | Most event types have a `DaemonXxxData` interface; `user_shell_*` is currently parsed ad hoc by the UI normalizer. |
@@ -155,6 +158,7 @@ These events are workspace-keyed, not session-keyed. The session reducer treats 
 - `alive: boolean` - becomes `false` after a terminal frame (`session_died`, `session_closed`, `client_evicted`, `stream_error`).
 - `currentModelId?: string` - from `model_switched`.
 - `displayName?: string` - from `session_metadata_updated`.
+- `recordingDegraded: boolean` - sticky session recording state from `session_recording_degraded`; an explicit `session_snapshot.recordingDegraded` value is authoritative.
 - `pendingPermissions: Record<string, DaemonPermissionRequestData>` - open requests keyed by `requestId`; cleared by `permission_resolved` / `permission_already_resolved`.
 - `lastSessionUpdate?: DaemonSessionUpdateData` - latest `session_update`.
 - `lastModelSwitchFailure?: DaemonModelSwitchFailedData` - from `model_switch_failed`.
@@ -172,7 +176,7 @@ These events are workspace-keyed, not session-keyed. The session reducer treats 
 - `workspaceInitCount`, `lastWorkspaceInit?` - from `workspace_initialized`.
 - `mcpRestartCount`, `lastMcpRestart?` - from `mcp_server_restarted`.
 - `mcpRestartRefusedCount`, `lastMcpRestartRefused?` - from `mcp_server_restart_refused`.
-- `settings_changed` / `settings_reloaded` - recognized by `asKnownDaemonEvent`; the session reducer does not maintain dedicated view-state fields, and UIs usually treat them as refresh signals.
+- `settings_changed` / `settings_reloaded` - recognized by `asKnownDaemonEvent`; the session reducer does not maintain dedicated view-state fields. Skill-toggle `settings_changed` events carry optional `mutation` metadata so hosts can apply Skill-only changes incrementally instead of reloading the task. Other UIs may still treat the event as a refresh signal.
 - `permissionVoteProgress: Record<string, DaemonPermissionPartialVoteData>` - consensus voting progress.
 - `forbiddenVotes: DaemonPermissionForbiddenData[]`, `forbiddenVoteCount` - policy-rejected vote records, capped at 32.
 - `awaitingResync: boolean` - set by `state_resync_required`; cleared when consumer resets view state.
@@ -244,7 +248,7 @@ Events triggered by a request that carried a registered `X-Qwen-Client-Id` may s
 
 ## Tool-call `_meta` (provenance / serverId)
 
-This is separate from envelope `_meta`: ACP `session/update` payloads can carry their own `_meta` in `event.data._meta`. `ToolCallEmitter` (`packages/cli/src/acp-integration/session/emitters/ToolCallEmitter.ts`) stamps two fields on `emitStart`, `emitResult`, and `emitError`:
+This is separate from envelope `_meta`: ACP `session/update` payloads can carry their own `_meta` in `event.data._meta`. `ToolCallEmitter` (`packages/cli/src/acp-integration/session/emitters/tool-call-emitter.ts`) stamps two fields on `emitStart`, `emitResult`, and `emitError`:
 
 | Field        | Type                                      | Resolution rule                                                                                                                                                            |
 | ------------ | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -263,14 +267,15 @@ The existing `_meta.toolName` display name is preserved. UI uses these fields to
 
 While `awaitingResync = true`, the reducer **skips delta application** and only allows the closed `RESYNC_PASSTHROUGH_TYPES` set:
 
-| Passthrough type        | Why it is still applied during resync                                          |
-| ----------------------- | ------------------------------------------------------------------------------ |
-| `state_resync_required` | Rare second resync should update `lastResyncRequired` / `resyncRequiredCount`. |
-| `session_died`          | Terminal stream signal must remain visible during resync.                      |
-| `session_closed`        | Same as above.                                                                 |
-| `client_evicted`        | Same as above.                                                                 |
-| `stream_error`          | Same as above.                                                                 |
-| `session_snapshot`      | Full-state authoritative frame; safe to apply during resync.                   |
+| Passthrough type             | Why it is still applied during resync                                          |
+| ---------------------------- | ------------------------------------------------------------------------------ |
+| `state_resync_required`      | Rare second resync should update `lastResyncRequired` / `resyncRequiredCount`. |
+| `session_died`               | Terminal stream signal must remain visible during resync.                      |
+| `session_closed`             | Same as above.                                                                 |
+| `client_evicted`             | Same as above.                                                                 |
+| `stream_error`               | Same as above.                                                                 |
+| `session_snapshot`           | Full-state authoritative frame; safe to apply during resync.                   |
+| `session_recording_degraded` | Sticky safety signal independent of transcript delta state.                    |
 
 `lastEventId` still advances monotonically through `advanceLastEventId(base)` during resync. After the caller resets and clears `awaitingResync`, subsequent deltas align to the correct cursor.
 
